@@ -1,0 +1,2310 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>삼성전자 보상 시뮬레이터</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Apple SD Gothic Neo','Malgun Gothic','Noto Sans KR',sans-serif;}
+table{border-collapse:collapse;}
+button{font-family:inherit;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo } = React;
+
+
+// ── 세금 ──
+const TB=[{l:14e6,r:.066},{l:50e6,r:.165},{l:88e6,r:.264},{l:150e6,r:.385},{l:300e6,r:.418},{l:500e6,r:.451},{l:Infinity,r:.495}];
+const tax=i=>{if(i<=0)return 0;let t=0,p=0;for(const b of TB){if(i<=p)break;t+=(Math.min(i,b.l)-p)*b.r;p=b.l;}return Math.round(t);};
+const mTax=(base,add)=>tax(base+add)-tax(base);
+
+// ── OPI1 ──
+// 재원: DS 영업이익 × 10% ÷ 총인원 ÷ 평균연봉 → 지급률 (최대 50%)
+// ── 인원수 기본값 (samsung-bonus.pages.dev 기준) ──
+// 메모리 27,000 / 공통 28,000 / 파운드리 11,500 / S.LSI 11,500 = 합계 78,000명
+// 메모리 27,400 / 공통 29,000 / 파운드리 14,000 / S.LSI 7,000 = 합계 77,400명
+const DEFAULT_HC={memory:27400,support:29000,foundry:14000,lsi:7000};
+const AVG_SAL=85000000; // 평균연봉 8,500만
+
+// OPI1/OPI2 계산 팩토리 (인원수를 파라미터로 받음)
+const makeCalc=(hcMem,hcSup,hcFnd,hcLsi)=>{
+  const hcTotal=hcMem+hcSup+hcFnd+hcLsi;
+  // 부문 가중인원: 공통 0.7, 나머지 1.0
+  const hcW_common=hcMem+(hcSup*0.7)+hcFnd+hcLsi;
+  // 사업부 가중인원: 메모리1.0 + 공통0.7 (적자사업부 제외)
+  const hcW_biz=hcMem+(hcSup*0.7);
+
+  const calcOPI1Rate=(ds,avgSal=AVG_SAL)=>{
+    if(ds<=0)return 0;
+    return Math.min(ds*1e12*0.10/hcTotal/avgSal, 0.5);
+  };
+
+  // calcSP: 내 연봉을 파라미터로 받아서 지급률 × 연봉으로 계산
+  // 이미지 방식: 지급률 = 재원 / 가중인원 / 평균연봉 → 내 OPI2 = 지급률 × 내연봉
+  const calcSP=(k,dsJo,yr,mySal=AVG_SAL)=>{
+    if(dsJo<=0)return 0;
+    const dsWon=dsJo*1e12;
+    const opi1PP=Math.min(dsWon*0.10/hcTotal, AVG_SAL*0.5);
+    const opi1Total=opi1PP*hcTotal;
+    const opi2Pool=(dsWon-opi1Total)*0.105;
+    // 지급률 계산 (평균연봉 기준)
+    const commonRate=opi2Pool*0.40/hcW_common/AVG_SAL;
+    const bizRate=opi2Pool*0.60/hcW_biz/AVG_SAL;
+
+    if(k==='memory') return Math.round(mySal*(commonRate+bizRate));
+    if(k==='support') return Math.round(mySal*(commonRate+bizRate)*0.70);
+    if(yr>=2027) return Math.round(mySal*commonRate*0.60);
+    return Math.round(mySal*commonRate); // 2026 유예
+  };
+
+  const calcYr=(dk,sal,ds,yr,threshold)=>{
+    const og=Math.round(sal*calcOPI1Rate(ds));
+    const sg=ds>=threshold?calcSP(dk,ds,yr,sal):0;
+    const tg=og+sg;
+    const ot=mTax(sal,og),st=mTax(sal+og,sg);
+    return{yr,og,sg,tg,ot,st,tt:ot+st,on:og-ot,sn:sg-st,tn:tg-ot-st,
+      spMet:ds>=threshold,threshold};
+  };
+  return{calcOPI1Rate,calcSP,calcYr};
+};
+
+// ── OPI2 지급 조건 (DS 영업이익 기준, 합의문) ──
+// 2026~2028: DS 200조 달성 시 지급, 2029~2035: DS 100조 달성 시 지급
+const PSU_BASE=85385;
+const PSU_CL={
+  cl2:{label:"CL1~2 (사원·대리)",sh:200},
+  cl3:{label:"CL3~4 (과장·부장)",sh:300},
+};
+const PSU_M=[{a:0,b:20,m:0},{a:20,b:40,m:.5},{a:40,b:60,m:1},{a:60,b:80,m:1.3},{a:80,b:100,m:1.7},{a:100,b:999,m:2}];
+const psuM=p=>{for(const r of PSU_M)if(p>=r.a&&p<r.b)return r.m;return 2;};
+
+// ── 포맷 ──
+const fw=v=>{const a=Math.abs(v);if(a>=1e8)return`${(v/1e8).toFixed(2)}억원`;if(a>=1e4)return`${Math.round(v/1e4).toLocaleString()}만원`;return`${Math.round(v)}원`;};
+const fs2=v=>v>=1e8?`${(v/1e8).toFixed(1)}억`:v>=1e4?`${Math.round(v/1e4)}만`:`${Math.round(v)}`;
+
+// ── 색상 (다크/라이트 모드) ──
+const DARK={bg:"#06101d",bd:"rgba(255,255,255,0.09)",blue:"#1499ff",cyan:"#00d8ff",green:"#00f090",yellow:"#ffd060",red:"#ff5050",purple:"#b060ff",orange:"#ff9030",muted:"#4e6880",sub:"#8aaabb",text:"#ddeeff",card:"rgba(255,255,255,0.04)",cardBd:"rgba(255,255,255,0.09)"};
+const LIGHT={bg:"#f0f4f8",bd:"rgba(0,0,0,0.1)",blue:"#0066cc",cyan:"#0088bb",green:"#007a40",yellow:"#c47a00",red:"#cc2200",purple:"#7733cc",orange:"#cc5500",muted:"#667788",sub:"#445566",text:"#1a2a3a",card:"rgba(255,255,255,0.85)",cardBd:"rgba(0,0,0,0.1)"};
+
+// ── 슬라이더 스타일 전역 주입
+const SliderStyle=()=>(
+  <style>{`
+    input[type=range]{-webkit-appearance:none;appearance:none;height:5px;border-radius:3px;background:rgba(128,128,128,0.3);outline:none;cursor:pointer;width:100%;}
+    input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:18px;height:18px;border-radius:50%;background:#1499ff;border:2px solid #fff;cursor:pointer;box-shadow:0 0 6px rgba(20,153,255,0.7);}
+    input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:#1499ff;border:2px solid #fff;cursor:pointer;}
+    input[type=number]{-moz-appearance:textfield;}
+    input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;}
+  `}</style>
+);
+
+// ── 연도별 계산 (App 내부에서 makeCalc 결과로 정의됨) ──
+const SP_THRESHOLD=(yr)=>yr<=2028?200:100;
+
+// ── 아파트 ──
+const APTS=[
+  {a:"강남구",  c:"서울",p:26e8,col:"#ff5050",e:"🏆",apt:"래미안대치팰리스",  url:"https://map.naver.com/v5/search/래미안대치팰리스"},
+  {a:"서초구",  c:"서울",p:22e8,col:"#ff7030",e:"🏆",apt:"아크로리버파크",    url:"https://map.naver.com/v5/search/아크로리버파크"},
+  {a:"송파구",  c:"서울",p:19e8,col:"#ff9030",e:"⭐",apt:"헬리오시티",        url:"https://map.naver.com/v5/search/헬리오시티"},
+  {a:"마포·용산",c:"서울",p:17e8,col:"#ffd060",e:"⭐",apt:"마포래미안푸르지오",url:"https://map.naver.com/v5/search/마포래미안푸르지오"},
+  {a:"성동·광진",c:"서울",p:15e8,col:"#c8d060",e:"⭐",apt:"왕십리센트라스",   url:"https://map.naver.com/v5/search/왕십리센트라스"},
+  {a:"노원구",  c:"서울",p:13e8,col:"#00d8ff",e:"✅",apt:"상계주공16단지",    url:"https://map.naver.com/v5/search/상계주공16단지"},
+  {a:"강서·양천",c:"서울",p:11e8,col:"#00d8ff",e:"✅",apt:"목동신시가지14단지",url:"https://map.naver.com/v5/search/목동신시가지14단지"},
+  {a:"분당·판교",c:"경기",p:14e8,col:"#00f090",e:"✅",apt:"판교알파리움1단지", url:"https://map.naver.com/v5/search/판교알파리움1단지"},
+  {a:"광교·수원",c:"경기",p:9e8, col:"#4dff90",e:"✅",apt:"광교중흥S클래스",   url:"https://map.naver.com/v5/search/광교중흥S클래스"},
+  {a:"용인·기흥",c:"경기",p:75e7,col:"#80ffa0",e:"✅",apt:"힐스테이트기흥",   url:"https://map.naver.com/v5/search/힐스테이트기흥"},
+  {a:"인천 연수",c:"인천",p:65e7,col:"#b060ff",e:"✅",apt:"송도더샵퍼스트월드",url:"https://map.naver.com/v5/search/송도더샵퍼스트월드"},
+  {a:"인천 계양",c:"인천",p:5e8, col:"#c080ff",e:"✅",apt:"힐스테이트자이계양",url:"https://map.naver.com/v5/search/힐스테이트자이계양"},
+  {a:"김포·파주",c:"경기",p:45e7,col:"#8aaabb",e:"✅",apt:"한강메트로자이",    url:"https://map.naver.com/v5/search/한강메트로자이"},
+];
+
+// ── OPI2 지급 조건 (DS 영업이익 기준, 합의문) ──
+// 2026~2028: DS 200조 달성 시 지급, 2029~2035: 100조 달성 시 지급
+
+// ── CL별 샐러리캡 (2026 합의, 만원 기준) ──
+const SAL_CAP={cl2:8000,cl3:11000,cl4:13000};
+const CL_BY_DIV={memory:"cl3",lsi:"cl3",foundry:"cl3",support:"cl3"};
+
+// ── DS 영업이익 시나리오 ──
+const SCENARIOS={
+  bull2:{label:"🚀🚀 슈퍼낙관", desc:"AI 수요 폭발, 메모리 슈퍼사이클",   ds:{2026:500,2027:600,2028:700,2029:600,2030:500}},
+  bull: {label:"🚀 낙관",       desc:"GS 상단, AI 수요 강세",             ds:{2026:400,2027:500,2028:600,2029:550,2030:480}},
+  base: {label:"📊 기본",       desc:"KB·미래에셋·GS·DB 컨센서스 평균",   ds:{2026:360,2027:440,2028:550,2029:480,2030:420}},
+  bear: {label:"🐻 비관",       desc:"반도체 사이클 둔화, 공급 과잉",      ds:{2026:280,2027:320,2028:380,2029:300,2030:250}},
+  bear2:{label:"🐻🐻 최악",     desc:"글로벌 경기침체, 수요 급감",         ds:{2026:180,2027:200,2028:240,2029:200,2030:180}},
+};
+
+
+// 5단계 시나리오 색상
+const dsColor=k=>k==="bull2"?"#00ff88":k==="bull"?"#00f090":k==="bear"?"#ff9030":k==="bear2"?"#ff5050":"#00d8ff";
+const stkColor=k=>k==="bull2"?"#00ff88":k==="bull"?"#00f090":k==="bear"?"#ff9030":k==="bear2"?"#ff5050":"#00d8ff";
+const CONS={2026:360,2027:440,2028:550,2029:480,2030:420};
+const YRS=[2026,2027,2028,2029,2030];
+const SYR=[2027,2028,2029,2030,2031,2032,2033];
+const YC=["#1499ff","#00d8ff","#00f090","#ffd060","#ff9030"];
+
+function App(){
+  const [darkMode,setDarkMode]=useState(false);
+  const C=darkMode?DARK:LIGHT;
+  // 인원수 state (기본값: samsung-bonus.pages.dev 기준)
+  const [hcMem,setHcMem]=useState(DEFAULT_HC.memory);   // 27,400
+  const [hcSup,setHcSup]=useState(DEFAULT_HC.support);  // 29,000
+  const [hcFnd,setHcFnd]=useState(DEFAULT_HC.foundry);  // 14,000
+  const [hcLsi,setHcLsi]=useState(DEFAULT_HC.lsi);      // 7,000
+  const hcTotal=hcMem+hcSup+hcFnd+hcLsi;
+  // 인원수 기반 계산 함수 생성
+  // makeCalc는 인원수 state 기반으로 계산 함수 생성
+  // useMemo 없이 직접 계산 (인원수 바뀌면 자동 재렌더)
+  const _calc=makeCalc(hcMem,hcSup,hcFnd,hcLsi);
+  const calcYr=(dk,sal,ds,yr)=>_calc.calcYr(dk,sal,ds,yr,SP_THRESHOLD(yr));
+  const Card=({children,ac,style={}})=>{
+    const bg=ac==='green'?darkMode?"rgba(0,240,144,0.07)":"rgba(0,180,100,0.08)":ac==='purple'?darkMode?"rgba(176,96,255,0.08)":"rgba(120,60,200,0.06)":C.card;
+    const bd=ac==='green'?C.green+"66":ac==='purple'?C.purple+"66":C.bd;
+    return <div style={{background:bg,border:`1px solid ${bd}`,borderRadius:12,padding:"14px 16px",...style}}>{children}</div>;
+  };
+  const Label=({c,children})=><div style={{fontSize:10,color:c||C.muted,letterSpacing:"1px",textTransform:"uppercase",marginBottom:8}}>{children}</div>;
+  const [dk,setDk]=useState("support");
+  const [clGrade,setClGrade]=useState("cl3"); // CL 등급 (샐러리캡 기준)
+  const [base,setBase]=useState(10000);
+  const [baseGr,setBaseGr]=useState(4.1);  // 기준 인상률 (Base-up)
+  const [perfGr,setPerfGr]=useState(1.0);  // 성과 인상률 기본: CL3 다등급
+  const [salGr,setSalGr]=useState(5.1);    // 합산 인상률 (baseGr+perfGr)
+  const [sal,setSal]=useState(Object.fromEntries(YRS.map((y,i)=>[y,Math.round(10000*1.062**i)])));
+  const [ds,setDs]=useState({...CONS});
+  const [scenario,setScenario]=useState("base");
+  const [stkNow,setStkNow]=useState(322500);
+  const [psuCl,setPsuCl]=useState("cl3");
+  // PSU 예상 주가: 자사주 탭 주가 상승률(agr) 연동 — 2026→2028 2년 복리
+  // agr state는 자사주 탭에서 설정됨
+  const [tab,setTab]=useState("set");
+  const [spx,setSpx]=useState(Object.fromEntries(SYR.map(y=>[y,322500])));
+  const [agr,setAgr]=useState(0);
+  const [aptGr,setAptGr]=useState(3);
+  const [stkGr,setStkGr]=useState(10);
+  const [aptStkGr,setAptStkGr]=useState(null);
+  const [salDs,setSalDs]=useState("base");   // 실수령탭 영업이익 시나리오
+  const [salStk,setSalStk]=useState("base"); // 실수령탭 주가 시나리오
+  const [cash,setCash]=useState(5);
+  const [loan,setLoan]=useState(5);
+  const [loanRate,setLoanRate]=useState(3.8);
+  const [loanYears,setLoanYears]=useState(30);
+  const [region,setRegion]=useState({l:"조정대상지역",ltv:50,dsr:40});
+
+  const CAP=SAL_CAP['cl4']*10000; // 부장 샐러리캡만 절대 상한 (13,000만원)
+  const totalGr=baseGr+perfGr;
+  const hBase=v=>{
+    const capped=Math.min(v,SAL_CAP['cl4']); // 기준연봉도 부장캡 이하로
+    setBase(capped);
+    setSal(Object.fromEntries(YRS.map((y,i)=>[y,Math.min(Math.round(capped*((1+totalGr/100)**i)),SAL_CAP['cl4'])])));
+  };
+  const hGr=(bg,pg)=>{const tg=bg+pg;setSalGr(tg);setSal(Object.fromEntries(YRS.map((y,i)=>[y,Math.min(Math.round(base*((1+tg/100)**i)),SAL_CAP['cl4'])])));};
+  const hSalGr=r=>{setSalGr(r);setSal(Object.fromEntries(YRS.map((y,i)=>[y,Math.min(Math.round(base*((1+r/100)**i)),SAL_CAP['cl4'])])));};
+  const setSalCapped=(yr,v)=>setSal(p=>({...p,[yr]:Math.min(v,SAL_CAP['cl4'])})); // 부장캡 초과 방지
+  const applyGr=r=>setSpx(Object.fromEntries(SYR.map((y,i)=>[y,Math.round(stkNow*((1+r/100)**(i+1)))])));
+
+  const yd=useMemo(()=>YRS.map(y=>calcYr(dk,sal[y]*10000,ds[y],y)),[dk,sal,ds,hcMem,hcSup,hcFnd,hcLsi]);
+  const cum=useMemo(()=>yd.reduce((s,r)=>({g:s.g+r.tg,t:s.t+r.tt,n:s.n+r.tn,oi:s.oi+r.on,sp:s.sp+r.sn}),{g:0,t:0,n:0,oi:0,sp:0}),[yd]);
+
+  const psuF=Math.round(stkNow*(1+agr/100)**2); // 자사주 탭 상승률 2년 복리 자동연동
+  const pPct=Math.round((psuF-PSU_BASE)/PSU_BASE*100);
+  const PSU_SH=PSU_CL[psuCl].sh; // CL별 약정주수
+  const pM=psuM(pPct),pTot=Math.round(PSU_SH*pM),pYr=Math.round(pTot/3),pYW=pYr*psuF;
+  const pt28=mTax((sal[2028]||0)*10000+(yd.find(r=>r.yr===2028)?.tg||0),pYW);
+  const pt29=mTax((sal[2029]||0)*10000+(yd.find(r=>r.yr===2029)?.tg||0),pYW);
+  const pt30=mTax((sal[2030]||0)*10000+(yd.find(r=>r.yr===2030)?.tg||0),pYW);
+  const pNA=[pYW-pt28,pYW-pt29,pYW-pt30];
+  const pNet=pM>0?pNA.reduce((s,v)=>s+v,0):0;
+
+  const mxB=Math.max(...yd.map(r=>r.tg),1);
+  const smMap=useMemo(()=>{
+    const m={};
+    yd.forEach(r=>{const py=r.yr+1,ts=Math.floor(r.sn/stkNow),s1=Math.floor(ts/3),s2=Math.floor(ts/3),s3=ts-s1-s2;
+      [[py,s1],[py+1,s2],[py+2,s3]].forEach(([y,sh])=>{m[y]=(m[y]||0)+sh*(spx[y]||stkNow);});});
+    return m;
+  },[yd,stkNow,spx]);
+  const smE=Object.entries(smMap).sort((a,b)=>+a[0]-+b[0]);
+  const smTot=Object.values(smMap).reduce((s,v)=>s+v,0);
+  const spTotN=yd.reduce((s,r)=>s+r.sn,0);
+
+  // 부동산
+  const sAt=y=>Math.round(stkNow*(1+stkGr/100)**(y-2026));
+  const aAt=(p,y)=>Math.round(p*(1+aptGr/100)**(y-2026));
+  const aptYrs=[2027,2028,2029,2030,2031,2032,2033];
+  const cbY=useMemo(()=>{ // 기본값 (부동산탭 밖에서도 필요할 경우 대비)
+    const m={};
+    yd.forEach(r=>{const py=r.yr+1,ts=Math.floor(r.sn/stkNow),s1=Math.floor(ts/3),s2=Math.floor(ts/3),s3=ts-s1-s2;
+      const sAtDef=y=>Math.round(stkNow*(1+agr/100)**(y-2026));
+      m[py]=(m[py]||0)+r.on+s1*sAtDef(py);m[py+1]=(m[py+1]||0)+s2*sAtDef(py+1);m[py+2]=(m[py+2]||0)+s3*sAtDef(py+2);});
+    [[2028,pNA[0]],[2029,pNA[1]],[2030,pNA[2]]].forEach(([y,v])=>{m[y]=(m[y]||0)+(pM>0?v:0);});
+    let run=0;const cum={};aptYrs.forEach(y=>{run+=(m[y]||0);cum[y]=run;});
+    return {cash:m,cum};
+  },[yd,stkNow,agr,pNA,pM]);
+  const fcum=cbY.cum[2033]||0;
+  const mxC=Math.max(...aptYrs.map(y=>cbY.cash[y]||0),1);
+
+  const TABS=[["set","⚙️ 설정"],["c","📊 성과금"],["l","🔒 자사주"],["p","📈 PSU"],["mx","🔀 비교"],["tax","💰 절세"],["sal","💵 실수령"],["a","🏠 부동산"],["fc","🌐 전망"],["guide","📖 산식"]];
+
+  // ── 시나리오 매트릭스 계산 ──
+  const STK_SCENARIOS={
+    bull2:{label:"🚀🚀 슈퍼낙관", gr:20},
+    bull: {label:"🚀 낙관",       gr:12},
+    base: {label:"📊 기본",       gr:8},
+    bear: {label:"🐻 비관",       gr:0},
+    bear2:{label:"🐻🐻 최악",     gr:-10},
+  };
+  const DS_KEYS=["bull2","bull","base","bear","bear2"];
+  const STK_KEYS=["bull2","bull","base","bear","bear2"];
+
+  const calcMatrix=()=>{
+    const matrix={};
+    DS_KEYS.forEach(dk2=>{
+      matrix[dk2]={};
+      STK_KEYS.forEach(sk=>{
+        const dsSc=SCENARIOS[dk2].ds;
+        const stkGr2=STK_SCENARIOS[sk].gr;
+        // 연도별 계산
+        const ydM=YRS.map(y=>calcYr(dk,sal[y]*10000,dsSc[y],y));
+        // 5년 성과급 세후 합계
+        const opiNet=ydM.reduce((s,r)=>s+r.on,0);
+        const spNet=ydM.reduce((s,r)=>s+r.sn,0);
+        // 자사주 매도 (주가 상승률 반영)
+        const stkAt=y=>Math.round(stkNow*(1+stkGr2/100)**(y-2026));
+        let stockSell=0;
+        ydM.forEach(r=>{
+          const py=r.yr+1,ts=Math.floor(r.sn/stkNow),s1=Math.floor(ts/3),s2=Math.floor(ts/3),s3=ts-s1-s2;
+          stockSell+=s1*stkAt(py)+s2*stkAt(py+1)+s3*stkAt(py+2);
+        });
+        // PSU — 2028.10 평가주가로 이익금 확정, 3년 분할 수령하지만 금액은 모두 2028 주가 기준
+        const psuF2=Math.round(stkNow*(1+stkGr2/100)**2); // 2028.10 평가주가
+        const pPct2=Math.round((psuF2-PSU_BASE)/PSU_BASE*100);
+        const pM2=psuM(pPct2);
+        const PSU_SH2=PSU_CL[psuCl].sh;
+        const pTot2=Math.round(PSU_SH2*pM2);
+        const pYr2=Math.round(pTot2/3);
+        const pW=pYr2*psuF2; // 연간 수령액 (2028 주가 고정)
+        const pt28_2=mTax((sal[2028]||0)*10000+(ydM.find(r=>r.yr===2028)?.tg||0),pW);
+        const pt29_2=mTax((sal[2029]||0)*10000+(ydM.find(r=>r.yr===2029)?.tg||0),pW);
+        const pt30_2=mTax((sal[2030]||0)*10000+(ydM.find(r=>r.yr===2030)?.tg||0),pW);
+        const psuNet=pM2>0?((pW-pt28_2)+(pW-pt29_2)+(pW-pt30_2)):0;
+        // 총합
+        const total=opiNet+stockSell+psuNet;
+        matrix[dk2][sk]={opiNet,spNet,stockSell,psuNet,total};
+      });
+    });
+    return matrix;
+  };
+  const matrix=useMemo(calcMatrix,[dk,sal,stkNow,psuCl,base,hcMem,hcSup,hcFnd,hcLsi]);
+
+  return(
+    <div id="sim-root" style={{minHeight:"100vh",background:darkMode?`linear-gradient(160deg,${C.bg},#0b1726)`:"#f0f4f8",fontFamily:"'Apple SD Gothic Neo','Malgun Gothic',sans-serif",color:C.text,transition:"background 0.3s"}}>
+      <SliderStyle/>
+      {/* 헤더 */}
+      <div style={{borderBottom:`1px solid ${C.bd}`,padding:"10px 14px",background:darkMode?"rgba(0,0,0,0.28)":"rgba(255,255,255,0.85)"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+          <div style={{width:28,height:28,borderRadius:8,background:"linear-gradient(135deg,#1499ff,#0044bb)",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:13,color:"#fff",flexShrink:0}}>S</div>
+          <div style={{flex:1}}>
+            <div style={{fontSize:13,fontWeight:700,color:C.text}}>삼성전자 보상 시뮬레이터</div>
+            <div style={{fontSize:9,color:C.muted}}>OPI1 · OPI2 · PSU · 2026 노사합의</div>
+          </div>
+          <button onClick={()=>setDarkMode(d=>!d)} style={{
+            padding:"5px 10px",borderRadius:20,fontSize:11,fontWeight:700,cursor:"pointer",
+            border:`1px solid ${C.bd}`,background:"transparent",color:C.text,flexShrink:0}}>
+            {darkMode?"☀️":"🌙"}
+          </button>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:4}}>
+          {TABS.map(([k,l])=>(
+            <button key={k} onClick={()=>setTab(k)} style={{
+              padding:"6px 2px",borderRadius:10,fontSize:9,fontWeight:600,cursor:"pointer",textAlign:"center",
+              border:tab===k?`1.5px solid ${C.blue}`:`1px solid ${C.bd}`,
+              background:tab===k?darkMode?"rgba(20,153,255,0.15)":"rgba(0,100,200,0.1)":darkMode?"rgba(255,255,255,0.04)":"rgba(0,0,0,0.03)",
+              color:tab===k?C.blue:C.muted}}>
+              {l}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{maxWidth:720,margin:"0 auto",padding:"14px 12px"}}>
+
+      {/* ══ 5년 누적 ══ */}
+      {/* ══ 설정 탭 ══ */}
+      {tab==="set"&&<>
+        {/* 인원수 설정 */}
+        <Card style={{marginBottom:12}}>
+          <Label>👥 사업부별 인원수 설정</Label>
+          <div style={{fontSize:9,color:C.muted,marginBottom:8,padding:"5px 8px",borderRadius:6,
+            background:darkMode?"rgba(0,216,255,0.05)":"rgba(0,150,200,0.05)",border:`1px solid ${C.cyan}33`}}>
+            기본값: samsung-bonus.pages.dev 기준 (77,400명) · 합계 <strong style={{color:C.cyan}}>{hcTotal.toLocaleString()}명</strong>
+          </div>
+          {[
+            {label:"💾 메모리",val:hcMem,set:setHcMem,def:DEFAULT_HC.memory},
+            {label:"🔧 공통부서",val:hcSup,set:setHcSup,def:DEFAULT_HC.support},
+            {label:"🏭 파운드리",val:hcFnd,set:setHcFnd,def:DEFAULT_HC.foundry},
+            {label:"🔬 S.LSI",val:hcLsi,set:setHcLsi,def:DEFAULT_HC.lsi},
+          ].map(x=>(
+            <div key={x.label} style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+              <div style={{fontSize:10,color:C.sub,width:70,flexShrink:0}}>{x.label}</div>
+              <button onClick={()=>x.set(v=>Math.max(1000,v-500))}
+                style={{padding:"4px 10px",borderRadius:7,border:`1px solid ${C.bd}`,background:"transparent",color:C.red,cursor:"pointer",fontSize:12,fontWeight:700}}>－</button>
+              <div style={{flex:1,textAlign:"center",fontSize:13,fontWeight:700,color:C.text}}>
+                {x.val.toLocaleString()}명
+              </div>
+              <button onClick={()=>x.set(v=>v+500)}
+                style={{padding:"4px 10px",borderRadius:7,border:`1px solid ${C.bd}`,background:"transparent",color:C.green,cursor:"pointer",fontSize:12,fontWeight:700}}>＋</button>
+              {x.val!==x.def&&(
+                <button onClick={()=>x.set(x.def)}
+                  style={{padding:"3px 6px",borderRadius:6,border:`1px solid ${C.bd}`,background:"transparent",color:C.muted,cursor:"pointer",fontSize:9}}>초기화</button>
+              )}
+            </div>
+          ))}
+          <div style={{textAlign:"center",marginTop:4}}>
+            <button onClick={()=>{setHcMem(DEFAULT_HC.memory);setHcSup(DEFAULT_HC.support);setHcFnd(DEFAULT_HC.foundry);setHcLsi(DEFAULT_HC.lsi);}}
+              style={{padding:"5px 16px",borderRadius:8,border:`1px solid ${C.bd}`,background:"transparent",color:C.muted,cursor:"pointer",fontSize:9}}>
+              전체 초기화 (77,400명)
+            </button>
+          </div>
+        </Card>
+        <Card style={{marginBottom:12}}>
+          <Label>🏢 소속 사업부</Label>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {Object.entries({memory:"메모리사업부",lsi:"시스템LSI사업부",foundry:"파운드리사업부",support:"지원·공통조직"}).map(([k,name])=>(
+              <button key={k} onClick={()=>setDk(k)} style={{
+                display:"flex",justifyContent:"space-between",alignItems:"center",
+                padding:"10px 14px",borderRadius:10,cursor:"pointer",
+                border:dk===k?`2px solid ${C.blue}`:`1px solid ${C.bd}`,
+                background:dk===k?"rgba(20,153,255,0.13)":"rgba(255,255,255,0.03)",
+                color:dk===k?C.text:C.sub,fontWeight:dk===k?700:400}}>
+                <span style={{fontSize:13}}>{name}</span>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <span style={{fontSize:9,color:dk===k?C.cyan:C.muted}}>
+                    {{memory:"메모리 2.7만명",lsi:"LSI 1.15만명",foundry:"파운드리 1.15만명",support:"공통 2.9만명"}[k]}
+                  </span>
+                  {dk===k&&<span style={{color:C.blue,fontWeight:700}}>✓</span>}
+                </div>
+              </button>
+            ))}
+          </div>
+        </Card>
+
+        {/* 연봉 설정 */}
+        <Card style={{marginBottom:12}}>
+          <Label>💰 기준 연봉 설정</Label>
+          {/* CL 선택 */}
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:9,color:C.muted,marginBottom:6}}>현재 직급 (참고용 · 부장 샐러리캡 1.3억 절대 상한)</div>
+            <div style={{display:"flex",gap:6}}>
+              {Object.entries({cl2:"CL1~2 (사원·대리)",cl3:"CL3 (과장)",cl4:"CL4 (부장)"}).map(([k,l])=>(
+                <button key={k} onClick={()=>{
+                  setClGrade(k);
+                  const def={cl2:1.5,cl3:1.0,cl4:0.0}[k];
+                  setPerfGr(def); hGr(baseGr,def);
+                }} style={{
+                  flex:1,padding:"7px 4px",borderRadius:8,fontSize:9,fontWeight:700,cursor:"pointer",textAlign:"center",
+                  border:clGrade===k?`1.5px solid ${C.blue}`:`1px solid ${C.bd}`,
+                  background:clGrade===k?"rgba(20,153,255,0.12)":"rgba(255,255,255,0.03)",
+                  color:clGrade===k?C.blue:C.muted}}>
+                  {l.split(' ')[0]}<br/>
+                  <span style={{fontSize:8,color:clGrade===k?C.cyan:C.muted}}>캡 {(SAL_CAP[k]/10000).toFixed(1)}억</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          {/* 기준 연봉 - 버튼으로 조작 (모바일 키보드 충돌 방지) */}
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:9,color:C.muted,marginBottom:8}}>2026년 기준 연봉 (세전)</div>
+            {/* 현재값 표시 */}
+            <div style={{textAlign:"center",marginBottom:10}}>
+              <div style={{fontSize:32,fontWeight:900,color:base>=SAL_CAP['cl4']?C.red:C.yellow}}>
+                {base.toLocaleString()}
+                <span style={{fontSize:14,color:C.muted,marginLeft:4}}>만원</span>
+              </div>
+              <div style={{fontSize:12,color:base>=SAL_CAP['cl4']?C.red:C.yellow,marginTop:2}}>
+                {base>=SAL_CAP['cl4']?"🔒 부장 샐러리캡":`= ${(base/10000).toFixed(2)}억원`}
+              </div>
+            </div>
+            {/* +/- 버튼 (500만 단위) */}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:6,marginBottom:8}}>
+              {[{l:"-500",d:-500},{l:"-100",d:-100},{l:"+100",d:100},{l:"+500",d:500}].map(b=>(
+                <button key={b.d} onClick={()=>hBase(Math.max(4000,Math.min(SAL_CAP['cl4'],base+b.d)))}
+                  style={{padding:"10px 0",borderRadius:10,fontSize:12,fontWeight:700,cursor:"pointer",
+                    border:`1px solid ${b.d<0?C.red+"66":C.green+"66"}`,
+                    background:b.d<0?darkMode?"rgba(255,80,80,0.08)":"rgba(200,50,50,0.06)":darkMode?"rgba(0,240,144,0.08)":"rgba(0,180,100,0.06)",
+                    color:b.d<0?C.red:C.green}}>
+                  {b.l}만
+                </button>
+              ))}
+            </div>
+            {/* 빠른 선택 버튼 */}
+            <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:8}}>
+              {[6000,7000,8000,9000,10000,11000,12000,13000].map(v=>(
+                <button key={v} onClick={()=>hBase(Math.min(v,SAL_CAP['cl4']))}
+                  style={{flex:"1 0 auto",padding:"6px 4px",borderRadius:8,fontSize:10,fontWeight:600,cursor:"pointer",
+                    border:base===v?`2px solid ${C.yellow}`:`1px solid ${C.bd}`,
+                    background:base===v?darkMode?"rgba(255,208,60,0.15)":"rgba(180,140,0,0.1)":darkMode?"rgba(255,255,255,0.04)":"rgba(0,0,0,0.03)",
+                    color:base===v?C.yellow:C.muted}}>
+                  {v/10000}억
+                </button>
+              ))}
+            </div>
+            {/* 슬라이더 */}
+            <input type="range" min={4000} max={SAL_CAP['cl4']} step={500} value={base}
+              onChange={e=>hBase(+e.target.value)}
+              onTouchEnd={e=>hBase(+e.target.value)}
+              style={{width:"100%",accentColor:C.yellow,height:5,cursor:"pointer"}}/>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:8,color:C.muted,marginTop:3}}>
+              <span>4,000만</span><span>8,500만</span><span>1.3억 (부장캡)</span>
+            </div>
+          </div>
+          {/* 인상률 */}
+          <div style={{background:"rgba(255,208,60,0.07)",border:"1px solid rgba(255,208,60,0.2)",borderRadius:9,padding:"12px 14px"}}>
+            <div style={{fontSize:10,color:C.yellow,fontWeight:700,marginBottom:10}}>
+              연봉 인상률: <span style={{fontSize:15}}>{totalGr.toFixed(1)}%</span>
+              <span style={{fontSize:9,color:C.muted,marginLeft:8}}>기준 {baseGr}% + 성과 {perfGr}%</span>
+            </div>
+            <div style={{marginBottom:8}}>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:5}}>
+                <span style={{color:C.muted}}>📌 기준 인상률 (Base-up)</span>
+                <strong style={{color:C.cyan}}>{baseGr}%</strong>
+              </div>
+              <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                {[{l:"4.1%(2026합의)",r:4.1},{l:"5%",r:5},{l:"6%",r:6},{l:"7%",r:7}].map(s=>(
+                  <button key={s.r} onClick={()=>{setBaseGr(s.r);hGr(s.r,perfGr);}} style={{
+                    padding:"4px 10px",borderRadius:8,fontSize:10,fontWeight:600,cursor:"pointer",
+                    border:baseGr===s.r?`1.5px solid ${C.cyan}`:`1px solid ${C.bd}`,
+                    background:baseGr===s.r?"rgba(0,216,255,0.1)":"rgba(255,255,255,0.03)",
+                    color:baseGr===s.r?C.cyan:C.muted}}>{s.l}</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:5}}>
+                <span style={{color:C.muted}}>⭐ 성과 인상률 (가·나·다 등급)</span>
+                <strong style={{color:C.green}}>{perfGr}%</strong>
+              </div>
+              {/* 2026 확정 인상률 안내 */}
+              <div style={{fontSize:8,color:C.muted,marginBottom:6,padding:"5px 8px",borderRadius:6,
+                background:darkMode?"rgba(0,216,255,0.05)":"rgba(0,150,200,0.06)",border:`1px solid ${C.cyan}33`}}>
+                📊 2026 블라인드 집계 · CL2: 가7.5/나4.5/다1.5% · CL3: 가6.2/나3.3/다1.0% · CL4: 가4.5/나2.2/다0.0%
+              </div>
+              <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                {(clGrade==='cl2'
+                  ?[{l:"가(7.5%)",r:7.5,c:"#ffd060"},{l:"나(4.5%)",r:4.5,c:"#00d8ff"},{l:"다(1.5%)",r:1.5,c:"#8aaabb"},{l:"라(0%)",r:0,c:"#ff5050"}]
+                  :clGrade==='cl4'
+                  ?[{l:"가(4.5%)",r:4.5,c:"#ffd060"},{l:"나(2.2%)",r:2.2,c:"#00d8ff"},{l:"다(0.0%)",r:0,c:"#8aaabb"}]
+                  :[{l:"가(6.2%)",r:6.2,c:"#ffd060"},{l:"나(3.3%)",r:3.3,c:"#00d8ff"},{l:"다(1.0%)",r:1.0,c:"#8aaabb"},{l:"라(0%)",r:0,c:"#ff5050"}]
+                ).map(s=>(
+                  <button key={s.r} onClick={()=>{setPerfGr(s.r);hGr(baseGr,s.r);}} style={{
+                    padding:"4px 10px",borderRadius:8,fontSize:10,fontWeight:600,cursor:"pointer",
+                    border:perfGr===s.r?`1.5px solid ${s.c}`:`1px solid ${C.bd}`,
+                    background:perfGr===s.r?`rgba(${s.c.replace('#','').match(/../g).map(h=>parseInt(h,16)).join(',')},0.12)`:darkMode?"rgba(255,255,255,0.03)":"rgba(0,0,0,0.03)",
+                    color:perfGr===s.r?s.c:C.muted}}>{s.l}</button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </Card>
+
+        {/* DS 영업이익 시나리오 */}
+        <Card style={{marginBottom:12}}>
+          <Label>📊 DS 영업이익 시나리오</Label>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+            {Object.entries(SCENARIOS).map(([k,v])=>{
+              const c=k==="bull"?C.green:k==="bear"?C.red:C.cyan;
+              return(
+                <button key={k} onClick={()=>{setScenario(k);setDs({...v.ds});}} style={{
+                  padding:"12px 8px",borderRadius:10,cursor:"pointer",textAlign:"center",
+                  border:scenario===k?`2px solid ${c}`:`1px solid ${C.bd}`,
+                  background:scenario===k?`rgba(${c.replace('#','').match(/../g).map(h=>parseInt(h,16)).join(',')},0.1)`:"rgba(255,255,255,0.03)"}}>
+                  <div style={{fontSize:12,fontWeight:700,color:scenario===k?c:C.sub,marginBottom:3}}>{v.label.split(' ')[0]}{" "}{v.label.split(' ')[1]}</div>
+                  <div style={{fontSize:8,color:C.muted,marginBottom:6}}>{v.desc}</div>
+                  <div style={{display:"flex",justifyContent:"center",gap:3}}>
+                    {Object.entries(v.ds).slice(0,3).map(([yr,val])=>(
+                      <div key={yr} style={{textAlign:"center"}}>
+                        <div style={{fontSize:7,color:C.muted}}>{yr.slice(2)}</div>
+                        <div style={{fontSize:9,fontWeight:700,color:scenario===k?c:C.muted}}>{val}</div>
+                      </div>
+                    ))}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </Card>
+
+        {/* 주가 시나리오 */}
+        <Card style={{marginBottom:12}}>
+          <Label>📈 삼성전자 주가 시나리오</Label>
+          <div style={{marginBottom:10,fontSize:10,color:C.muted}}>
+            현재 주가: <strong style={{color:C.cyan}}>{stkNow.toLocaleString()}원</strong>
+            &nbsp;·&nbsp;기준가(PSU): <strong style={{color:C.purple}}>85,385원</strong>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr",gap:6,marginBottom:10}}>
+            {[
+              {k:"bull2",label:"🚀🚀",desc:"슈퍼낙관",gr:20, c:"#00ff88"},
+              {k:"bull", label:"🚀",  desc:"낙관",    gr:12, c:C.green},
+              {k:"base", label:"📊",  desc:"기본",    gr:8,  c:C.cyan},
+              {k:"bear", label:"🐻",  desc:"비관",    gr:0,  c:C.orange},
+              {k:"bear2",label:"🐻🐻",desc:"최악",    gr:-10,c:C.red},
+            ].map(s=>(
+              <button key={s.k} onClick={()=>{setAgr(s.gr);applyGr(s.gr);}} style={{
+                padding:"10px 4px",borderRadius:10,cursor:"pointer",textAlign:"center",
+                border:agr===s.gr?`2px solid ${s.c}`:`1px solid ${C.bd}`,
+                background:agr===s.gr?`rgba(${s.c.replace('#','').match(/../g).map(h=>parseInt(h,16)).join(',')},0.1)`:"rgba(255,255,255,0.03)"}}>
+                <div style={{fontSize:14,marginBottom:2}}>{s.label}</div>
+                <div style={{fontSize:9,fontWeight:700,color:agr===s.gr?s.c:C.sub}}>{s.desc}</div>
+                <div style={{fontSize:9,color:agr===s.gr?s.c:C.muted,marginTop:2}}>
+                  {s.gr>0?`+${s.gr}%`:s.gr===0?"0%":`${s.gr}%`}
+                </div>
+                <div style={{fontSize:8,color:C.muted,marginTop:1}}>
+                  {Math.round(stkNow*(1+s.gr/100)**7/10000)}만
+                </div>
+              </button>
+            ))}
+          </div>
+        </Card>
+
+        {/* 현재 설정 요약 + 바로가기 */}
+        <Card ac="green" style={{marginBottom:12}}>
+          <Label c={C.green}>✅ 현재 설정 요약</Label>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+            {[
+              {l:"소속",         v:{memory:"메모리",lsi:"시스템LSI",foundry:"파운드리",support:"지원·공통"}[dk], c:C.cyan},
+              {l:"기준연봉",     v:`${base.toLocaleString()}만원`, c:C.yellow},
+              {l:"연봉인상률",   v:`${totalGr.toFixed(1)}%/년`,   c:C.green},
+              {l:"DS 시나리오",  v:scenario==="bull"?"🚀 낙관":scenario==="bear"?"🐻 비관":"📊 기본", c:scenario==="bull"?C.green:scenario==="bear"?C.red:C.cyan},
+              {l:"주가 시나리오",v:agr===20?"🚀🚀 슈퍼낙관 +20%":agr===12?"🚀 낙관 +12%":agr===8?"📊 기본 +8%":agr===0?"🐻 비관 0%":"🐻🐻 최악 -10%", c:agr===20?"#00ff88":agr===12?C.green:agr===8?C.cyan:agr===0?C.orange:C.red},
+              {l:"직급",         v:{cl2:"CL1~2",cl3:"CL3(과장)",cl4:"CL4(부장)"}[clGrade], c:C.blue},
+            ].map(x=>(
+              <div key={x.l} style={{background:"rgba(0,0,0,0.2)",borderRadius:8,padding:"8px 12px"}}>
+                <div style={{fontSize:9,color:C.muted,marginBottom:2}}>{x.l}</div>
+                <div style={{fontSize:13,fontWeight:700,color:x.c}}>{x.v}</div>
+              </div>
+            ))}
+          </div>
+          <button onClick={()=>setTab("c")} style={{
+            width:"100%",padding:"12px",borderRadius:10,fontSize:12,fontWeight:700,cursor:"pointer",
+            background:"linear-gradient(135deg,#1499ff,#0044bb)",border:"none",color:"#fff"}}>
+            📊 성과금 시뮬레이션 시작 →
+          </button>
+        </Card>
+      </>}
+
+      {/* ══ 성과금 탭 ══ */}
+      {tab==="c"&&<>
+        <Card style={{marginBottom:12}}>
+          <Label>DS 영업이익 시나리오 선택</Label>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+            {Object.entries(SCENARIOS).map(([k,v])=>(
+              <button key={k} onClick={()=>{setScenario(k);setDs({...v.ds});}} style={{
+                padding:"10px 8px",borderRadius:10,cursor:"pointer",textAlign:"center",
+                border:scenario===k?`2px solid ${k==='bull'?C.green:k==='bear'?C.red:C.cyan}`:`1px solid ${C.bd}`,
+                background:scenario===k?k==='bull'?"rgba(0,240,144,0.1)":k==='bear'?"rgba(255,80,80,0.1)":"rgba(0,216,255,0.1)":"rgba(255,255,255,0.03)"}}>
+                <div style={{fontSize:11,fontWeight:700,color:scenario===k?k==='bull'?C.green:k==='bear'?C.red:C.cyan:C.sub,marginBottom:3}}>{v.label}</div>
+                <div style={{fontSize:8,color:C.muted,lineHeight:1.4}}>{v.desc}</div>
+                <div style={{marginTop:6,display:"flex",justifyContent:"center",gap:3}}>
+                  {Object.entries(v.ds).map(([yr,val])=>(
+                    <div key={yr} style={{textAlign:"center"}}>
+                      <div style={{fontSize:7,color:C.muted}}>{yr.slice(2)}</div>
+                      <div style={{fontSize:8,fontWeight:700,color:scenario===k?k==='bull'?C.green:k==='bear'?C.red:C.cyan:C.muted}}>{val}</div>
+                    </div>
+                  ))}
+                </div>
+              </button>
+            ))}
+          </div>
+          <div style={{fontSize:9,color:C.muted,padding:"5px 8px",borderRadius:6,background:"rgba(255,255,255,0.03)"}}>
+            시나리오 선택 시 아래 DS 영업이익 값 자동 적용 · 개별 수정도 가능
+          </div>
+        </Card>
+
+        <Card style={{marginBottom:12}}>
+          <Label>연도별 입력 (DS 컨센서스 기본값)</Label>
+          <div style={{fontSize:9,color:C.muted,marginBottom:6,padding:"5px 8px",borderRadius:6,background:"rgba(0,216,255,0.06)",border:`1px solid rgba(0,216,255,0.12)`}}>
+            📊 2026:<strong style={{color:C.cyan}}>360조</strong> 2027:<strong style={{color:C.cyan}}>440조</strong> 2028:<strong style={{color:C.cyan}}>550조</strong> 2029:<strong style={{color:C.cyan}}>480조</strong> 2030:<strong style={{color:C.cyan}}>420조</strong> · KB·미래에셋·GS·DB 평균
+          </div>
+          <div style={{fontSize:9,color:C.orange,marginBottom:8,padding:"5px 8px",borderRadius:6,background:"rgba(255,144,48,0.07)",border:"1px solid rgba(255,144,48,0.2)"}}>
+            ⚠️ OPI2 지급 조건: <strong>2026~2028년 DS 200조↑</strong>, <strong>2029~2035년 DS 100조↑</strong> 달성 시만 지급 (합의문)
+          </div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+              <thead><tr style={{borderBottom:`1px solid ${C.bd}`}}>
+                {["귀속","수령","DS(조)","OPI1%","OPI1세전","OPI2","합계세전","합계세후"].map(h=>(
+                  <th key={h} style={{padding:"5px 4px",color:C.muted,fontSize:9,fontWeight:600,textAlign:"right",whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr></thead>
+              <tbody>{yd.map((r,i)=>(
+                <tr key={r.yr} style={{borderBottom:`1px solid ${C.bd}`}}>
+                  <td style={{padding:"8px 4px",color:YC[i],fontWeight:700}}>{r.yr}</td>
+                  <td style={{padding:"8px 4px",textAlign:"right",color:C.muted,fontSize:9}}>{r.yr+1}</td>
+                  <td style={{padding:"3px"}}>
+                    <input type="number" inputMode="numeric" min={-20} max={600} step={10} value={ds[r.yr]} onChange={e=>{setDs(p=>({...p,[r.yr]:+e.target.value}));setScenario("custom");}}
+                      style={{background:"rgba(255,255,255,0.06)",border:`1px solid ${C.bd}`,borderRadius:5,color:C.cyan,fontSize:10,fontWeight:700,padding:"3px 5px",width:55,textAlign:"right"}}/>
+                  </td>
+                  <td style={{padding:"8px 4px",textAlign:"right",color:C.sub,fontSize:9}}>{Math.round(_calc.calcOPI1Rate(ds[r.yr])*100)}%</td>
+                  <td style={{padding:"8px 4px",textAlign:"right",color:C.cyan,fontSize:9}}>{fs2(r.og)}</td>
+                  <td style={{padding:"8px 4px",textAlign:"right",color:r.spMet?C.yellow:C.red,fontSize:9}}>
+                    {r.spMet?fs2(r.sg):<span title={`DS ${r.threshold}조 미달`}>❌ 미지급</span>}
+                  </td>
+                  <td style={{padding:"8px 4px",textAlign:"right",color:C.text,fontWeight:600,fontSize:10}}>{fw(r.tg)}</td>
+                  <td style={{padding:"8px 4px",textAlign:"right",color:YC[i],fontWeight:800,fontSize:11}}>{fw(r.tn)}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        </Card>
+
+        <Card style={{marginBottom:12}}>
+          <Label>연도별 비교</Label>
+          {yd.map((r,i)=>{const yc=YC[i],bw=Math.round(r.tg/mxB*100),nw=Math.round(r.tn/mxB*100),rgb=yc.replace('#','').match(/../g).map(h=>parseInt(h,16)).join(',');return(
+            <div key={r.yr} style={{marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:3,fontSize:10}}>
+                <span style={{color:yc,fontWeight:700}}>{r.yr}년 실적({r.yr+1}년 수령)</span>
+                <span style={{color:C.muted}}>세전 {fw(r.tg)} → 세후 <strong style={{color:yc}}>{fw(r.tn)}</strong></span>
+              </div>
+              <div style={{position:"relative",height:11,background:"rgba(255,255,255,0.05)",borderRadius:6,overflow:"hidden"}}>
+                <div style={{position:"absolute",left:0,top:0,height:"100%",width:`${bw}%`,background:`rgba(${rgb},0.22)`,borderRadius:6}}/>
+                <div style={{position:"absolute",left:0,top:0,height:"100%",width:`${nw}%`,background:yc,borderRadius:6}}/>
+              </div>
+              <div style={{display:"flex",gap:10,marginTop:2,fontSize:9,color:C.muted}}>
+                <span>OPI1 {fw(r.on)}</span><span>OPI2 {fw(r.sn)}</span><span style={{marginLeft:"auto"}}>세금 -{fw(r.tt)}</span>
+              </div>
+            </div>
+          );})}
+        </Card>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+          <Card style={{textAlign:"center",padding:"18px"}}>
+            <div style={{fontSize:10,color:C.muted,marginBottom:5}}>5년 세전 누적</div>
+            <div style={{fontSize:30,fontWeight:900,color:C.text}}>{fw(cum.g)}</div>
+            <div style={{fontSize:10,color:C.red,marginTop:4}}>세금 -{fw(cum.t)}</div>
+          </Card>
+          <Card ac="green" style={{textAlign:"center",padding:"18px"}}>
+            <div style={{fontSize:10,color:C.muted,marginBottom:5}}>✅ 5년 세후 누적</div>
+            <div style={{fontSize:30,fontWeight:900,color:C.green}}>{fw(cum.n)}</div>
+            <div style={{fontSize:10,color:C.muted,marginTop:4}}>연평균 <strong style={{color:C.green}}>{fw(Math.round(cum.n/5))}</strong></div>
+          </Card>
+        </div>
+        <Card style={{marginBottom:10}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+            {[{l:"OPI1(세후·현금)",v:cum.oi,c:C.cyan},{l:"OPI2(세후·자사주)",v:cum.sp,c:C.yellow},{l:"PSU(세후·자사주)",v:pM>0?pNet:0,c:C.purple}].map(x=>(
+              <div key={x.l} style={{textAlign:"center",background:"rgba(0,0,0,0.2)",borderRadius:9,padding:"12px 6px"}}>
+                <div style={{fontSize:9,color:C.muted,marginBottom:3,lineHeight:1.4}}>{x.l}</div>
+                <div style={{fontSize:16,fontWeight:800,color:x.c}}>{fw(x.v)}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{borderTop:`1px solid ${C.bd}`,margin:"10px 0 6px"}}/>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span style={{fontSize:11,color:C.muted}}>PSU 포함 총 수령 (세후)</span>
+            <span style={{fontSize:24,fontWeight:900,color:C.green}}>{fw(cum.n+(pM>0?pNet:0))}</span>
+          </div>
+        </Card>
+      </>}
+
+      {/* ══ 자사주 락업 ══ */}
+      {tab==="l"&&<>
+        {/* 주가 시나리오 선택 */}
+        <Card style={{marginBottom:12}}>
+          <Label>📈 삼성전자 주가 시나리오</Label>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr",gap:6,marginBottom:10}}>
+            {[
+              {k:"bull2",label:"🚀🚀",desc:"슈퍼낙관", gr:20,  c:"#00ff88"},
+              {k:"bull", label:"🚀",  desc:"낙관",     gr:12,  c:C.green},
+              {k:"base", label:"📊",  desc:"기본",     gr:8,   c:C.cyan},
+              {k:"bear", label:"🐻",  desc:"비관",     gr:0,   c:C.orange},
+              {k:"bear2",label:"🐻🐻",desc:"최악",     gr:-10, c:C.red},
+            ].map(s=>(
+              <button key={s.k} onClick={()=>{setAgr(s.gr);applyGr(s.gr);}} style={{
+                padding:"8px 4px",borderRadius:10,cursor:"pointer",textAlign:"center",
+                border:agr===s.gr?`2px solid ${s.c}`:`1px solid ${C.bd}`,
+                background:agr===s.gr?`rgba(${s.c.replace('#','').match(/../g).map(h=>parseInt(h,16)).join(',')},0.1)`:"rgba(255,255,255,0.03)"}}>
+                <div style={{fontSize:14,marginBottom:2}}>{s.label}</div>
+                <div style={{fontSize:9,fontWeight:700,color:agr===s.gr?s.c:C.sub}}>{s.desc}</div>
+                <div style={{fontSize:9,color:agr===s.gr?s.c:C.muted,marginTop:2}}>
+                  {s.gr>0?`+${s.gr}%`:s.gr===0?"0%":`${s.gr}%`}
+                </div>
+                <div style={{fontSize:8,color:C.muted,marginTop:1}}>
+                  {Math.round(stkNow*(1+s.gr/100)**7/10000)}만
+                </div>
+              </button>
+            ))}
+          </div>
+          <div style={{fontSize:9,color:C.muted,padding:"5px 8px",borderRadius:6,background:"rgba(255,255,255,0.03)"}}>
+            💡 슈퍼낙관 +20%/년 · 낙관 +12%(KB목표가) · 기본 +8% · 비관 0% · 최악 -10%/년 · 2033년 예상가 기준
+          </div>
+        </Card>
+
+        <Card style={{marginBottom:12}}>
+          <Label>현재 주가 + 연간 상승률 세부 설정</Label>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+            <input type="number" inputMode="numeric" min={50000} max={900000} step={5000} value={stkNow}
+              onChange={e=>{setStkNow(+e.target.value);setSpx(Object.fromEntries(SYR.map(y=>[y,+e.target.value])));setAgr(0);}}
+              style={{background:"rgba(255,255,255,0.07)",border:`1px solid ${C.bd}`,borderRadius:9,color:C.cyan,fontSize:20,fontWeight:800,padding:"8px 11px",width:160,textAlign:"right"}}/>
+            <span style={{fontSize:12,color:C.muted}}>원</span>
+            <button onClick={()=>{setSpx(Object.fromEntries(SYR.map(y=>[y,stkNow])));setAgr(0);}} style={{padding:"6px 12px",borderRadius:8,fontSize:10,fontWeight:600,cursor:"pointer",border:`1px solid ${C.bd}`,background:"rgba(255,255,255,0.05)",color:C.sub}}>현재가 일괄적용</button>
+          </div>
+          <div style={{background:"rgba(0,216,255,0.06)",border:"1px solid rgba(0,216,255,0.14)",borderRadius:9,padding:"12px 14px"}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:6,fontSize:11}}>
+              <span style={{color:C.sub}}>📈 연간 상승률</span>
+              <span style={{fontSize:18,fontWeight:800,color:agr>0?C.green:agr<0?C.red:C.muted}}>{agr>0?"+":""}{agr}%</span>
+            </div>
+            <input type="range" min={-20} max={50} step={5} value={agr}
+              onChange={e=>{setAgr(+e.target.value);applyGr(+e.target.value);}} style={{width:"100%",accentColor:agr>=0?C.green:C.red,height:4,cursor:"pointer",marginBottom:4}}/>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:C.muted,marginBottom:8}}>
+              <span>-20%</span><span>0%</span><span>+25%</span><span>+50%</span>
+            </div>
+            <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:10}}>
+              {[{l:"-20%",r:-20},{l:"-10%",r:-10},{l:"0%",r:0},{l:"+5%",r:5},{l:"+10%",r:10},{l:"+15%",r:15},{l:"+20%",r:20},{l:"+30%",r:30},{l:"+50%",r:50}].map(s=>(
+                <button key={s.r} onClick={()=>{setAgr(s.r);applyGr(s.r);}} style={{padding:"3px 8px",borderRadius:10,fontSize:9,fontWeight:600,cursor:"pointer",
+                  border:agr===s.r?`1.5px solid ${s.r<0?C.red:s.r===0?C.muted:C.green}`:`1px solid ${C.bd}`,
+                  background:agr===s.r?s.r<0?"rgba(255,80,80,0.1)":"rgba(0,240,144,0.1)":"rgba(255,255,255,0.03)",
+                  color:agr===s.r?s.r<0?C.red:C.green:C.muted}}>{s.l}</button>
+              ))}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3}}>
+              {SYR.map((y,i)=>{const px=spx[y]||stkNow,chg=Math.round((px-stkNow)/stkNow*100);return(
+                <div key={y} style={{textAlign:"center",background:"rgba(0,0,0,0.25)",borderRadius:6,padding:"4px 2px"}}>
+                  <div style={{fontSize:8,color:C.muted}}>{y}</div>
+                  <div style={{fontSize:10,fontWeight:700,color:C.cyan}}>{Math.round(px/10000)}만</div>
+                  <div style={{fontSize:8,color:chg>=0?C.cyan:C.red}}>{chg>0?"+":""}{chg}%</div>
+                </div>
+              );})}
+            </div>
+          </div>
+        </Card>
+
+        <Card style={{marginBottom:12}}>
+          <Label>귀속연도별 매도 스케줄 (세후 기준)</Label>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+              <thead><tr style={{borderBottom:`1px solid ${C.bd}`}}>
+                {["귀속","지급","OPI2(세후)","주식수","즉시매각","1년락업","2년락업","합계"].map((h,i)=>(
+                  <th key={i} style={{padding:"5px 4px",color:C.muted,fontSize:9,fontWeight:600,textAlign:"right",whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr></thead>
+              <tbody>{yd.map((r,i)=>{
+                const py=r.yr+1,ts=Math.floor(r.sn/stkNow),s1=Math.floor(ts/3),s2=Math.floor(ts/3),s3=ts-s1-s2;
+                const p1=spx[py]||stkNow,p2=spx[py+1]||stkNow,p3=spx[py+2]||stkNow;
+                const w1=s1*p1,w2=s2*p2,w3=s3*p3;
+                return(
+                  <tr key={r.yr} style={{borderBottom:`1px solid ${C.bd}`}}>
+                    <td style={{padding:"8px 4px",color:YC[i],fontWeight:700}}>{r.yr}</td>
+                    <td style={{padding:"8px 4px",textAlign:"right",color:C.muted,fontSize:9}}>{py}</td>
+                    <td style={{padding:"8px 4px",textAlign:"right"}}>
+                      <div style={{fontSize:9,color:C.muted}}>세전 {fs2(r.sg)}</div>
+                      <div style={{fontSize:9,color:C.red}}>세금 -{fs2(r.st)}</div>
+                      <div style={{fontSize:10,color:C.green,fontWeight:700}}>세후 {fs2(r.sn)}</div>
+                    </td>
+                    <td style={{padding:"8px 4px",textAlign:"right",color:C.sub,fontSize:9}}>{ts}주<div style={{fontSize:8,color:C.muted}}>세후기준</div></td>
+                    <td style={{padding:"4px 3px",textAlign:"right"}}>
+                      <div style={{fontSize:8,color:C.muted}}>{py}년({s1}주)</div>
+                      <input type="number" inputMode="numeric" min={50000} max={900000} step={5000} value={p1} onChange={e=>setSpx(p=>({...p,[py]:+e.target.value}))}
+                        style={{background:"rgba(255,255,255,0.06)",border:`1px solid ${C.bd}`,borderRadius:4,color:C.cyan,fontSize:9,fontWeight:700,padding:"2px 4px",width:80,textAlign:"right"}}/>
+                      <div style={{fontSize:10,color:C.green,fontWeight:700}}>{fw(w1)}</div>
+                    </td>
+                    <td style={{padding:"4px 3px",textAlign:"right"}}>
+                      <div style={{fontSize:8,color:C.muted}}>{py+1}년({s2}주)</div>
+                      <input type="number" inputMode="numeric" min={50000} max={900000} step={5000} value={p2} onChange={e=>setSpx(p=>({...p,[py+1]:+e.target.value}))}
+                        style={{background:"rgba(255,255,255,0.06)",border:`1px solid ${C.bd}`,borderRadius:4,color:C.cyan,fontSize:9,fontWeight:700,padding:"2px 4px",width:80,textAlign:"right"}}/>
+                      <div style={{fontSize:10,color:C.green,fontWeight:700}}>{fw(w2)}</div>
+                    </td>
+                    <td style={{padding:"4px 3px",textAlign:"right"}}>
+                      <div style={{fontSize:8,color:C.muted}}>{py+2}년({s3}주)</div>
+                      <input type="number" inputMode="numeric" min={50000} max={900000} step={5000} value={p3} onChange={e=>setSpx(p=>({...p,[py+2]:+e.target.value}))}
+                        style={{background:"rgba(255,255,255,0.06)",border:`1px solid ${C.bd}`,borderRadius:4,color:C.cyan,fontSize:9,fontWeight:700,padding:"2px 4px",width:80,textAlign:"right"}}/>
+                      <div style={{fontSize:10,color:C.green,fontWeight:700}}>{fw(w3)}</div>
+                    </td>
+                    <td style={{padding:"8px 4px",textAlign:"right",color:YC[i],fontWeight:800,fontSize:11}}>{fw(w1+w2+w3)}</td>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
+          </div>
+        </Card>
+
+        <Card style={{marginBottom:12}}>
+          <Label>연도별 매도 가능 금액 + 누적</Label>
+          {(()=>{let cs=0;return smE.map(([y,v])=>{cs+=v;const bw=Math.round(v/Math.max(...smE.map(([,x])=>x))*100),cbw=Math.round(cs/smTot*100);return(
+            <div key={y} style={{marginBottom:9}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:3,fontSize:10}}>
+                <span style={{color:C.cyan,fontWeight:700}}>{y}년</span>
+                <div><span style={{color:C.green,fontWeight:700}}>{fw(v)}</span><span style={{color:C.muted,fontSize:9,marginLeft:6}}>누적 <strong style={{color:C.yellow}}>{fw(cs)}</strong></span></div>
+              </div>
+              <div style={{position:"relative",height:8,background:"rgba(255,255,255,0.05)",borderRadius:4,overflow:"hidden",marginBottom:2}}>
+                <div style={{position:"absolute",left:0,top:0,height:"100%",width:`${bw}%`,background:"linear-gradient(90deg,#00d8ff,#00f090)",borderRadius:4}}/>
+              </div>
+              <div style={{position:"relative",height:4,background:"rgba(255,255,255,0.04)",borderRadius:3,overflow:"hidden"}}>
+                <div style={{position:"absolute",left:0,top:0,height:"100%",width:`${cbw}%`,background:"linear-gradient(90deg,rgba(255,208,60,.5),rgba(255,208,60,.9))",borderRadius:3}}/>
+              </div>
+            </div>
+          );});})()} 
+        </Card>
+        <Card ac="green" style={{marginBottom:10}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+            {[{l:"OPI2 세전",v:fw(yd.reduce((s,r)=>s+r.sg,0)),c:C.yellow},{l:"OPI2 세후",v:fw(spTotN),c:C.cyan},{l:"총 매도 가능",v:fw(smTot),c:C.green}].map(x=>(
+              <div key={x.l} style={{textAlign:"center",background:"rgba(0,0,0,0.2)",borderRadius:9,padding:"10px 6px"}}>
+                <div style={{fontSize:9,color:C.muted,marginBottom:3}}>{x.l}</div>
+                <div style={{fontSize:15,fontWeight:800,color:x.c}}>{x.v}</div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      </>}
+
+      {/* ══ PSU ══ */}
+      {tab==="p"&&<>
+        {/* 자사주 탭 연동 안내 */}
+        <Card style={{marginBottom:12,padding:"12px 16px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <div style={{fontSize:20}}>🔗</div>
+            <div>
+              <div style={{fontSize:11,fontWeight:700,color:C.cyan,marginBottom:3}}>
+                주가 시나리오 자동 연동 (🔒 자사주 탭 기준)
+              </div>
+              <div style={{fontSize:10,color:C.muted}}>
+                현재 선택: <strong style={{color:agr===12?C.green:agr===8?C.cyan:C.red}}>
+                  {agr===20?"🚀🚀 슈퍼낙관 (+20%/년)":agr===12?"🚀 낙관 (+12%/년)":agr===8?"📊 기본 (+8%/년)":agr===0?"🐻 비관 (현재가 유지)":"🐻🐻 최악 (-10%/년)"}
+                </strong>
+                &nbsp;→ 2028년 예상주가 <strong style={{color:C.purple}}>{Math.round(psuF/10000)}만원</strong>
+              </div>
+              <div style={{fontSize:9,color:C.muted,marginTop:3}}>
+                기준가 85,385원 대비 <strong style={{color:C.yellow}}>+{pPct}%</strong> → 배수 <strong style={{color:C.purple}}>{pM}배</strong>
+                &nbsp;· 주가 변경은 🔒 자사주 탭에서
+              </div>
+            </div>
+          </div>
+        </Card>
+        {/* CL 선택 */}
+        <Card style={{marginBottom:12}}>
+          <Label>직급(CL) 선택</Label>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            {Object.entries(PSU_CL).map(([k,v])=>(
+              <button key={k} onClick={()=>setPsuCl(k)} style={{
+                padding:"12px 10px",borderRadius:10,cursor:"pointer",textAlign:"center",
+                border:psuCl===k?`2px solid ${C.purple}`:`1px solid ${C.bd}`,
+                background:psuCl===k?"rgba(176,96,255,0.14)":"rgba(255,255,255,0.03)",
+                color:psuCl===k?C.text:C.sub}}>
+                <div style={{fontSize:12,fontWeight:700,color:psuCl===k?C.purple:C.sub}}>{v.label}</div>
+                <div style={{fontSize:18,fontWeight:900,color:psuCl===k?C.purple:C.muted,marginTop:4}}>기본 {v.sh}주</div>
+                <div style={{fontSize:9,color:C.muted,marginTop:2}}>최대 {v.sh*2}주 (2배)</div>
+              </button>
+            ))}
+          </div>
+        </Card>
+        {pM===0?<Card style={{textAlign:"center",padding:"24px",border:"1px solid rgba(255,80,80,0.3)",background:"rgba(255,80,80,0.07)"}}>
+          <div style={{fontSize:30,marginBottom:6}}>❌</div><div style={{fontSize:15,fontWeight:700,color:C.red}}>미지급</div>
+          <div style={{fontSize:11,color:C.muted,marginTop:4}}>기준가 대비 {pPct}% — 20% 미만 시 미지급</div>
+        </Card>:<>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:12}}>
+            {[{l:"기준가 대비",v:`+${pPct}%`,c:pPct>=100?C.green:pPct>=40?C.yellow:C.orange},{l:"지급배수",v:`${pM}배`,c:C.purple},{l:"총 주수",v:`${pTot}주`,c:C.purple}].map(x=>(
+              <Card key={x.l} ac="purple" style={{textAlign:"center",padding:"12px 6px"}}>
+                <div style={{fontSize:9,color:C.muted,marginBottom:3}}>{x.l}</div>
+                <div style={{fontSize:20,fontWeight:900,color:x.c}}>{x.v}</div>
+              </Card>
+            ))}
+          </div>
+          <Card style={{marginBottom:12}}>
+            <Label>연도별 수령</Label>
+            {[2028,2029,2030].map((y,i)=>{const g=pYW,tx=[pt28,pt29,pt30][i],n=pNA[i],tr=g>0?Math.round(tx/g*100):0;return(
+              <div key={y} style={{background:"rgba(176,96,255,0.07)",border:"1px solid rgba(176,96,255,0.18)",borderRadius:9,padding:"12px 14px",marginBottom:8}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                  <span style={{fontSize:13,fontWeight:800,color:C.purple}}>{y}년 ({pYr}주)</span>
+                  <div style={{textAlign:"right"}}>
+                    <div style={{fontSize:10,color:C.muted}}>세전 {fw(g)}</div>
+                    <div style={{fontSize:14,fontWeight:800,color:C.purple}}>세후 {fw(n)}</div>
+                  </div>
+                </div>
+                <div style={{display:"flex",height:5,borderRadius:3,overflow:"hidden",marginBottom:6}}>
+                  <div style={{width:`${100-tr}%`,background:C.purple}}/><div style={{width:`${tr}%`,background:"rgba(255,80,80,0.5)"}}/>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:10}}>
+                  <div style={{textAlign:"center"}}><div style={{fontSize:9,color:C.muted}}>세금</div><div style={{color:C.red,fontWeight:700}}>-{fw(tx)}({tr}%)</div></div>
+                  <div style={{textAlign:"center"}}><div style={{fontSize:9,color:C.muted}}>월 환산</div><div style={{color:C.cyan,fontWeight:700}}>{fw(Math.round(n/12))}</div></div>
+                  <div style={{textAlign:"center"}}><div style={{fontSize:9,color:C.muted}}>분기 환산</div><div style={{color:C.cyan,fontWeight:700}}>{fw(Math.round(n/4))}</div></div>
+                </div>
+              </div>
+            );})}
+          </Card>
+          <Card ac="purple" style={{marginBottom:10}}>
+            <Label c={C.purple}>PSU 3년 누적</Label>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+              <div style={{textAlign:"center",background:"rgba(0,0,0,0.2)",borderRadius:8,padding:"12px"}}>
+                <div style={{fontSize:9,color:C.muted,marginBottom:2}}>세전 합계</div>
+                <div style={{fontSize:20,fontWeight:900,color:C.text}}>{fw(pTot*psuF)}</div>
+              </div>
+              <div style={{textAlign:"center",background:"rgba(176,96,255,0.12)",borderRadius:8,padding:"12px",border:"1px solid rgba(176,96,255,0.3)"}}>
+                <div style={{fontSize:9,color:C.muted,marginBottom:2}}>✅ 세후 합계</div>
+                <div style={{fontSize:20,fontWeight:900,color:C.purple}}>{fw(pNet)}</div>
+              </div>
+            </div>
+          </Card>
+        </>}
+      </>}
+
+      {/* ══ 절세 탭 ══ */}
+      {tab==="tax"&&(()=>{
+        const IRP_MAX=3000000,PEN_MAX=6000000,ISA_MAX=3000000;
+        const annualInc=(sal[2026]||base)*10000;
+        const penRate=annualInc>55000000?0.132:0.165;
+        const irpSave=Math.round((IRP_MAX+PEN_MAX)*penRate);
+        const isaSave=Math.round(ISA_MAX*0.10);
+        const totalSave5=irpSave*5+isaSave*5;
+
+        // 현재 선택 시나리오 세금
+        const curRows=YRS.map(y=>calcYr(dk,sal[y]*10000,ds[y],y));
+        const curTotGross=curRows.reduce((s,r)=>s+r.tg,0);
+        const curTotTax=curRows.reduce((s,r)=>s+r.tt,0);
+        const curTotNet=curRows.reduce((s,r)=>s+r.tn,0);
+        const curTaxRate=Math.round(curTotTax/Math.max(curTotGross,1)*100);
+
+        // 5×5 세금 매트릭스 계산
+        const taxMatrix={};
+        DS_KEYS.forEach(dk2=>{
+          taxMatrix[dk2]={};
+          STK_KEYS.forEach(sk=>{
+            const rows=YRS.map(y=>calcYr(dk,sal[y]*10000,SCENARIOS[dk2].ds[y],y));
+            const gross=rows.reduce((s,r)=>s+r.tg,0);
+            const tax=rows.reduce((s,r)=>s+r.tt,0);
+            taxMatrix[dk2][sk]={gross,tax,net:gross-tax,rate:Math.round(tax/Math.max(gross,1)*100)};
+          });
+        });
+        const allTax=DS_KEYS.flatMap(dk2=>STK_KEYS.map(sk=>taxMatrix[dk2][sk].tax));
+        const maxTax=Math.max(...allTax,1),minTax=Math.min(...allTax);
+
+        return(<>
+          {/* 현재 선택 시나리오 상세 */}
+          <Card style={{marginBottom:12}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <Label>📊 현재 선택 시나리오 세금</Label>
+              <div style={{fontSize:9,color:C.muted}}>
+                {scenario==="bull2"?"🚀🚀 슈퍼낙관":scenario==="bull"?"🚀 낙관":scenario==="bear"?"🐻 비관":scenario==="bear2"?"🐻🐻 최악":"📊 기본"}
+              </div>
+            </div>
+            <div style={{fontSize:9,color:C.muted,marginBottom:10,padding:"5px 8px",borderRadius:6,
+              background:"rgba(255,80,80,0.06)",border:"1px solid rgba(255,80,80,0.2)"}}>
+              연봉: <strong style={{color:C.yellow}}>{base.toLocaleString()}만원</strong> ·
+              사업부: <strong style={{color:C.cyan}}>{{memory:"메모리",lsi:"LSI",foundry:"파운드리",support:"지원·공통"}[dk]}</strong> ·
+              누진세 적용 (각종 공제 전)
+            </div>
+            {/* 5년 요약 */}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+              {[
+                {l:"5년 세전 합계",  v:fw(curTotGross), c:C.text},
+                {l:"5년 납부 세금",  v:"-"+fw(curTotTax), c:C.red},
+                {l:"5년 세후 합계",  v:fw(curTotNet),   c:C.green},
+              ].map(x=>(
+                <div key={x.l} style={{textAlign:"center",background:"rgba(0,0,0,0.2)",borderRadius:8,padding:"10px 6px"}}>
+                  <div style={{fontSize:9,color:C.muted,marginBottom:3}}>{x.l}</div>
+                  <div style={{fontSize:14,fontWeight:900,color:x.c}}>{x.v}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{textAlign:"center",fontSize:10,color:C.muted,marginBottom:10}}>
+              실효세율 <strong style={{color:C.red,fontSize:14}}>{curTaxRate}%</strong>
+            </div>
+            {/* 연도별 세금 추이 */}
+            <div style={{fontSize:9,color:C.muted,marginBottom:6,fontWeight:700}}>연도별 세금 추이</div>
+            {curRows.map((r,i)=>{
+              const bw=Math.round(r.tg/Math.max(...curRows.map(x=>x.tg))*100);
+              const nw=Math.round(r.tn/Math.max(...curRows.map(x=>x.tg))*100);
+              return(
+                <div key={r.yr} style={{marginBottom:7}}>
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:9,marginBottom:2}}>
+                    <span style={{color:YC[i],fontWeight:700}}>{r.yr}</span>
+                    <span style={{color:C.muted}}>
+                      세전 {fw(r.tg)} → 세금 <strong style={{color:C.red}}>-{fw(r.tt)}</strong> → 세후 <strong style={{color:YC[i]}}>{fw(r.tn)}</strong>
+                    </span>
+                  </div>
+                  <div style={{height:10,background:"rgba(255,255,255,0.05)",borderRadius:4,overflow:"hidden",position:"relative"}}>
+                    <div style={{position:"absolute",height:"100%",width:`${bw}%`,background:`rgba(${YC[i].replace('#','').match(/../g).map(h=>parseInt(h,16)).join(',')},0.25)`,borderRadius:4}}/>
+                    <div style={{position:"absolute",height:"100%",width:`${nw}%`,background:YC[i],borderRadius:4}}/>
+                  </div>
+                </div>
+              );
+            })}
+          </Card>
+
+          {/* 5×5 세금 매트릭스 */}
+          <Card style={{marginBottom:12}}>
+            <Label>🔀 25가지 시나리오별 5년 납부 세금</Label>
+            <div style={{fontSize:9,color:C.muted,marginBottom:8}}>OPI1+OPI2 성과금 세금 합계 · 색이 진할수록 세금 많음</div>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"separate",borderSpacing:3}}>
+                <thead>
+                  <tr>
+                    <th style={{padding:"4px",fontSize:8,color:C.muted,textAlign:"center"}}></th>
+                    {STK_KEYS.map(sk=>(
+                      <th key={sk} style={{padding:"4px 2px",fontSize:8,color:stkColor(sk),textAlign:"center",fontWeight:700}}>
+                        {sk==="bull2"?"🚀🚀":sk==="bull"?"🚀":sk==="bear"?"🐻":sk==="bear2"?"🐻🐻":"📊"}
+                        <div style={{fontSize:7,color:C.muted,fontWeight:400}}>
+                          {STK_SCENARIOS[sk].gr>0?"+":""}{STK_SCENARIOS[sk].gr}%
+                        </div>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {DS_KEYS.map(dk2=>(
+                    <tr key={dk2}>
+                      <td style={{padding:"4px 2px",fontSize:8,fontWeight:700,color:dsColor(dk2),whiteSpace:"nowrap"}}>
+                        {dk2==="bull2"?"🚀🚀":dk2==="bull"?"🚀":dk2==="bear"?"🐻":dk2==="bear2"?"🐻🐻":"📊"}
+                        <span style={{fontSize:7,color:C.muted,marginLeft:2}}>
+                          {dk2==="bull2"?"500조":dk2==="bull"?"400조":dk2==="bear"?"280조":dk2==="bear2"?"180조":"360조"}
+                        </span>
+                      </td>
+                      {STK_KEYS.map(sk=>{
+                        const cell=taxMatrix[dk2][sk];
+                        const isCur=DS_KEYS.includes(scenario)&&dk2===scenario;
+                        // PSU는 주가에 따라 달라지지만 절세탭은 OPI1+OPI2 기준
+                        const ratio=(cell.tax-minTax)/(maxTax-minTax);
+                        const bg=`rgba(255,80,80,${0.05+ratio*0.3})`;
+                        const bd=`rgba(255,80,80,${0.15+ratio*0.4})`;
+                        return(
+                          <td key={sk} style={{padding:"2px"}}>
+                            <div style={{
+                              background:isCur?"rgba(255,255,255,0.1)":bg,
+                              border:isCur?"2px solid #fff":`1px solid ${bd}`,
+                              borderRadius:7,padding:"5px 3px",textAlign:"center"}}>
+                              <div style={{fontSize:10,fontWeight:800,color:isCur?"#fff":C.red}}>
+                                -{fs2(cell.tax)}
+                              </div>
+                              <div style={{fontSize:7,color:C.muted,marginTop:1}}>
+                                {cell.rate}%
+                              </div>
+                            </div>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{fontSize:8,color:C.muted,marginTop:6}}>
+              행: DS 영업이익 시나리오 · 열: 주가 시나리오 · 흰테두리: 현재 선택
+            </div>
+          </Card>
+
+          {/* 절세 수단 */}
+          <Card style={{marginBottom:12}}>
+            <Label>💡 절세 수단 활용 시 효과</Label>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+              <div style={{background:"rgba(255,80,80,0.08)",border:"1px solid rgba(255,80,80,0.25)",borderRadius:9,padding:"12px",textAlign:"center"}}>
+                <div style={{fontSize:10,color:C.muted,marginBottom:3}}>절세 전 5년 세금</div>
+                <div style={{fontSize:20,fontWeight:900,color:C.red}}>-{fw(curTotTax)}</div>
+              </div>
+              <div style={{background:darkMode?"rgba(0,240,144,0.08)":"rgba(0,140,70,0.07)",border:darkMode?"1px solid rgba(0,240,144,0.3)":"1px solid rgba(0,140,70,0.3)",borderRadius:9,padding:"12px",textAlign:"center"}}>
+                <div style={{fontSize:10,color:C.muted,marginBottom:3}}>절세 후 5년 세금</div>
+                <div style={{fontSize:20,fontWeight:900,color:C.green}}>-{fw(Math.max(0,curTotTax-totalSave5))}</div>
+              </div>
+            </div>
+            <div style={{background:"rgba(0,240,144,0.1)",border:"1px solid rgba(0,240,144,0.3)",borderRadius:9,padding:"12px",textAlign:"center",marginBottom:10}}>
+              <div style={{fontSize:10,color:C.muted,marginBottom:3}}>💰 5년간 절세 효과 (IRP 900만 + ISA 풀 활용)</div>
+              <div style={{fontSize:26,fontWeight:900,color:C.green}}>+{fw(totalSave5)}</div>
+              <div style={{fontSize:9,color:C.muted,marginTop:3}}>연평균 {fw(Math.round(totalSave5/5))} 절세</div>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              {[
+                {title:"🏦 IRP",limit:"연 300만",save:irpSave,rate:`${(penRate*100).toFixed(1)}%`,desc:"납입액 직접 세금 차감",c:C.blue},
+                {title:"📈 연금저축",limit:"연 600만",save:Math.round(PEN_MAX*penRate),rate:`${(penRate*100).toFixed(1)}%`,desc:"IRP 합산 900만 한도",c:C.cyan},
+                {title:"📦 ISA→IRP",limit:"전환액 10%",save:isaSave,rate:"10%",desc:"만기 후 연금계좌 이전",c:C.green},
+              ].map(item=>(
+                <div key={item.title} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                  background:"rgba(255,255,255,0.03)",border:`1px solid ${C.bd}`,borderRadius:9,padding:"10px 14px"}}>
+                  <div>
+                    <div style={{fontSize:11,fontWeight:700,color:item.c}}>{item.title} <span style={{fontSize:9,color:C.muted}}>{item.limit} · {item.rate}</span></div>
+                    <div style={{fontSize:9,color:C.muted,marginTop:2}}>{item.desc}</div>
+                  </div>
+                  <div style={{textAlign:"right"}}>
+                    <div style={{fontSize:9,color:C.muted}}>연 절세</div>
+                    <div style={{fontSize:16,fontWeight:900,color:item.c}}>-{fw(item.save)}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          <div style={{fontSize:9,color:"#4e6880",lineHeight:1.8,padding:"7px 10px",borderRadius:8,
+            background:"rgba(255,200,50,0.04)",border:"1px solid rgba(255,200,50,0.12)"}}>
+            ⚠️ 세액공제는 각종 공제 미적용 누진세 기준 · IRP/연금저축 중도해지 시 16.5% 기타소득세 · 실제 절세액은 공인세무사 상담 권장
+          </div>
+        </>);
+      })()}
+
+            {/* ══ 실수령 탭 ══ */}
+      {tab==="sal"&&(()=>{
+        // 4대보험 요율 (2026)
+        const NHIS=0.03595, LTCI_R=0.9448/7.19, NPS_RATE=0.0475, NPS_CAP=6370000, EI=0.009;
+        const calc4ins=m=>{
+          const nhis=Math.floor(m*NHIS/10)*10;
+          const ltci=Math.floor(nhis*LTCI_R/10)*10;
+          const nps=Math.floor(Math.min(m,NPS_CAP)*NPS_RATE/10)*10;
+          const ei=Math.floor(m*EI/10)*10;
+          return{nhis,ltci,nps,ei,total:nhis+ltci+nps+ei};
+        };
+        const itax=m=>Math.round(mTax(0,m*12)/12);
+
+        // salDs, salStk: 컴포넌트 최상단에서 선언됨
+        // 연도별 계산 (영업이익+주가 시나리오 모두 반영)
+        const calcM=(dk2,sk,yr)=>{
+          const dsSc=SCENARIOS[dk2]?.ds||CONS;
+          const dsVal=dsSc[yr]||CONS[yr]||360;
+          const stkGr2=STK_SCENARIOS[sk].gr;
+          const annSal=(sal[yr]||base)*10000;
+          const mSal=Math.round(annSal/12);
+          const row=calcYr(dk,annSal,dsVal,yr);
+          const psuF2=Math.round(stkNow*(1+stkGr2/100)**2);
+          const pPct2=Math.round((psuF2-PSU_BASE)/PSU_BASE*100);
+          const pM2=psuM(pPct2);
+          const PSU_SH2=PSU_CL[psuCl].sh;
+          const pTot2=Math.round(PSU_SH2*pM2);
+          const pYr2=Math.round(pTot2/3);
+          const pYW2=pYr2*psuF2;
+          const pt28=mTax((sal[2028]||0)*10000+(calcYr(dk,(sal[2028]||0)*10000,dsSc[2028]||550,2028).tg||0),pYW2);
+          const pt29=mTax((sal[2029]||0)*10000+(calcYr(dk,(sal[2029]||0)*10000,dsSc[2029]||480,2029).tg||0),pYW2);
+          const pt30=mTax((sal[2030]||0)*10000+(calcYr(dk,(sal[2030]||0)*10000,dsSc[2030]||420,2030).tg||0),pYW2);
+          const psuNet=pM2>0?((pYW2-pt28)+(pYW2-pt29)+(pYW2-pt30)):0;
+          const ins=calc4ins(mSal);
+          const it=itax(mSal);
+          const extraNhis=Math.floor(row.tg/12*NHIS/10)*10;
+          const extraLtci=Math.floor(extraNhis*LTCI_R/10)*10;
+          return{yr,mSal,annSal,row,ins,it,net:mSal-ins.total-it,dsVal,stkGr2,psuF2,pM2,psuNet,extraNhis,extraLtci};
+        };
+
+        const YRS5=[2026,2027,2028,2029,2030];
+        const curD=calcM(salDs,salStk,2026);
+
+        return(<>
+          {/* 헤더 */}
+          <Card style={{marginBottom:12}}>
+            <div style={{fontSize:11,fontWeight:700,color:C.text,marginBottom:4}}>💵 월 실수령 시뮬레이션</div>
+            <div style={{fontSize:9,color:C.muted,lineHeight:1.7}}>
+              사업부: <strong style={{color:C.cyan}}>{{memory:"메모리",lsi:"LSI",foundry:"파운드리",support:"지원·공통"}[dk]}</strong> ·
+              기준연봉: <strong style={{color:C.yellow}}>{base.toLocaleString()}만원</strong> ·
+              인상률: <strong style={{color:C.green}}>{totalGr.toFixed(1)}%/년</strong>
+            </div>
+          </Card>
+
+          {/* 시나리오 선택 */}
+          <Card style={{marginBottom:12}}>
+            <Label>🎯 시나리오 선택 (영업이익 × 주가)</Label>
+            <div style={{marginBottom:8}}>
+              <div style={{fontSize:9,color:C.muted,marginBottom:5}}>📊 영업이익</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr",gap:4}}>
+                {DS_KEYS.map(dk2=>{
+                  const c=dsColor(dk2);
+                  const lbl=dk2==="bull2"?"🚀🚀":dk2==="bull"?"🚀":dk2==="bear"?"🐻":dk2==="bear2"?"🐻🐻":"📊";
+                  const sub=dk2==="bull2"?"500조":dk2==="bull"?"400조":dk2==="bear"?"280조":dk2==="bear2"?"180조":"360조";
+                  return(
+                    <button key={dk2} onClick={()=>setSalDs(dk2)} style={{
+                      padding:"7px 3px",borderRadius:9,cursor:"pointer",textAlign:"center",
+                      border:salDs===dk2?`2px solid ${c}`:`1px solid ${C.bd}`,
+                      background:salDs===dk2?`rgba(${c.replace("#","").match(/../g).map(h=>parseInt(h,16)).join(",")},0.12)`:"rgba(255,255,255,0.03)",
+                      color:salDs===dk2?c:C.muted,fontSize:10,fontWeight:700}}>
+                      <div>{lbl}</div>
+                      <div style={{fontSize:7,color:salDs===dk2?c:C.muted,marginTop:1}}>{sub}</div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div>
+              <div style={{fontSize:9,color:C.muted,marginBottom:5}}>📈 주가 (자사주·PSU 연동)</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr",gap:4}}>
+                {STK_KEYS.map(sk=>{
+                  const c=stkColor(sk);
+                  const lbl=sk==="bull2"?"🚀🚀":sk==="bull"?"🚀":sk==="bear"?"🐻":sk==="bear2"?"🐻🐻":"📊";
+                  const sub=STK_SCENARIOS[sk].gr>0?`+${STK_SCENARIOS[sk].gr}%`:STK_SCENARIOS[sk].gr===0?"0%":`${STK_SCENARIOS[sk].gr}%`;
+                  return(
+                    <button key={sk} onClick={()=>setSalStk(sk)} style={{
+                      padding:"7px 3px",borderRadius:9,cursor:"pointer",textAlign:"center",
+                      border:salStk===sk?`2px solid ${c}`:`1px solid ${C.bd}`,
+                      background:salStk===sk?`rgba(${c.replace("#","").match(/../g).map(h=>parseInt(h,16)).join(",")},0.12)`:"rgba(255,255,255,0.03)",
+                      color:salStk===sk?c:C.muted,fontSize:10,fontWeight:700}}>
+                      <div>{lbl}</div>
+                      <div style={{fontSize:7,color:salStk===sk?c:C.muted,marginTop:1}}>{sub}</div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            {/* 현재 선택 요약 */}
+            <div style={{marginTop:10,padding:"8px 12px",borderRadius:8,
+              background:"rgba(255,255,255,0.04)",border:`1px solid ${C.bd}`,fontSize:10}}>
+              <span style={{color:C.muted}}>현재 선택: </span>
+              <strong style={{color:dsColor(salDs)}}>
+                영업이익 {salDs==="bull2"?"슈퍼낙관":salDs==="bull"?"낙관":salDs==="bear"?"비관":salDs==="bear2"?"최악":"기본"}
+              </strong>
+              <span style={{color:C.muted}}> × </span>
+              <strong style={{color:stkColor(salStk)}}>
+                주가 {salStk==="bull2"?"슈퍼낙관":salStk==="bull"?"낙관":salStk==="bear"?"비관":salStk==="bear2"?"최악":"기본"}
+              </strong>
+              <span style={{color:C.muted,marginLeft:8,fontSize:9}}>
+                PSU 배수: <strong style={{color:C.purple}}>
+                  {psuM(Math.round((Math.round(stkNow*(1+STK_SCENARIOS[salStk].gr/100)**2)-PSU_BASE)/PSU_BASE*100))}배
+                </strong>
+              </span>
+            </div>
+          </Card>
+
+          {/* 연도별 실수령 카드 */}
+          {YRS5.map((yr,i)=>{
+            const d=calcM(salDs,salStk,yr);
+            const yc=YC[i];
+            // 건보료 연말정산: 성과급 포함 연소득 기준으로 재산정
+            const totalAnnInc=d.annSal+d.row.tg;
+            const avgMonthInc=Math.round(totalAnnInc/12);
+            const adjNhis=Math.floor(avgMonthInc*NHIS/10)*10;
+            const adjLtci=Math.floor(adjNhis*LTCI_R/10)*10;
+            const extraTotal=Math.max(0,(adjNhis+adjLtci-d.ins.nhis-d.ins.ltci)*12);
+            // 연간 실질 수령
+            const annualBase=d.net*12;
+            const annualBonus=d.row.tn;
+            const annualPsu=yr===2028?d.psuNet:0;
+            const annualReal=annualBase+annualBonus+annualPsu-extraTotal;
+            return(
+              <Card key={yr} style={{marginBottom:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                  <div>
+                    <span style={{fontSize:14,fontWeight:800,color:yc}}>{yr}년</span>
+                    <span style={{fontSize:9,color:C.muted,marginLeft:8}}>DS {d.dsVal}조 · 연봉 {(d.annSal/1e4).toFixed(0)}만</span>
+                  </div>
+                  <div style={{textAlign:"right"}}>
+                    <div style={{fontSize:9,color:C.muted}}>연간 실질 수령</div>
+                    <div style={{fontSize:20,fontWeight:900,color:yc}}>{fw(annualReal)}</div>
+                  </div>
+                </div>
+
+                {/* 월급 공제 */}
+                <div style={{background:"rgba(0,0,0,0.2)",borderRadius:9,padding:"10px 12px",marginBottom:8}}>
+                  <div style={{fontSize:9,color:C.muted,fontWeight:700,marginBottom:5}}>📋 월급 공제 내역 (연봉 기준 고정)</div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:5,marginBottom:5}}>
+                    {[
+                      {l:"월 기본급",    v:d.mSal,       c:C.text},
+                      {l:"4대보험",      v:-d.ins.total, c:C.red},
+                      {l:"소득세(원천)", v:-d.it,        c:C.red},
+                      {l:"월 실수령",    v:d.net,        c:yc},
+                    ].map(x=>(
+                      <div key={x.l} style={{textAlign:"center"}}>
+                        <div style={{fontSize:7,color:C.muted,marginBottom:2}}>{x.l}</div>
+                        <div style={{fontSize:11,fontWeight:700,color:x.c}}>{x.v<0?"-":""}{fw(Math.abs(x.v))}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{display:"flex",gap:5,flexWrap:"wrap",fontSize:7,color:C.muted,
+                    borderTop:`1px solid ${C.bd}`,paddingTop:4}}>
+                    <span>건강보험 -{fw(d.ins.nhis)}</span>
+                    <span>장기요양 -{fw(d.ins.ltci)}</span>
+                    <span>국민연금 -{fw(d.ins.nps)}</span>
+                    <span>고용보험 -{fw(d.ins.ei)}</span>
+                  </div>
+                </div>
+
+                {/* 성과금 */}
+                <div style={{background:"rgba(0,216,255,0.06)",border:"1px solid rgba(0,216,255,0.15)",borderRadius:9,padding:"10px 12px",marginBottom:8}}>
+                  <div style={{fontSize:9,color:C.cyan,fontWeight:700,marginBottom:6}}>
+                    🎁 {yr+1}년 성과금 ({yr}년 실적)
+                    {!d.row.spMet&&<span style={{color:C.red,marginLeft:6}}>⚠️ DS {d.row.threshold}조 미달</span>}
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:5}}>
+                    {[
+                      {l:"OPI1 세후(현금)",    v:d.row.on,  c:C.cyan,   s:"~3월"},
+                      {l:"OPI2(자사주)", v:d.row.sn,  c:C.yellow, s:"~4월"},
+                      {l:"세금 합계",         v:-d.row.tt, c:C.red,    s:"누진세"},
+                    ].map(x=>(
+                      <div key={x.l} style={{textAlign:"center",background:"rgba(0,0,0,0.2)",borderRadius:7,padding:"6px 3px"}}>
+                        <div style={{fontSize:7,color:C.muted,marginBottom:2,lineHeight:1.3}}>{x.l}</div>
+                        <div style={{fontSize:11,fontWeight:800,color:x.c}}>{fw(Math.abs(x.v))}</div>
+                        <div style={{fontSize:7,color:C.muted,marginTop:1}}>{x.s}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 건보료 연말정산 — 시나리오별 핵심 차이 */}
+                <div style={{background:"rgba(255,80,80,0.07)",border:"1px solid rgba(255,80,80,0.22)",borderRadius:9,padding:"10px 12px",marginBottom:8}}>
+                  <div style={{fontSize:9,color:C.red,fontWeight:700,marginBottom:6}}>
+                    ⚠️ 건강보험 연말정산 추가 부과 (4월)
+                    <span style={{fontSize:8,color:C.muted,fontWeight:400,marginLeft:6}}>성과금 포함 시 시나리오별 차이 발생</span>
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:5}}>
+                    {[
+                      {l:"성과금포함 월평균소득",     v:fw(avgMonthInc),       c:C.text},
+                      {l:"조정건보료(성과금포함)",v:fw(adjNhis+adjLtci),  c:C.orange},
+                      {l:"기납건보료(연봉기준)",  v:fw(d.ins.nhis+d.ins.ltci), c:C.muted},
+                      {l:"추가납부(연간)",        v:fw(extraTotal),        c:extraTotal>0?C.red:C.green},
+                    ].map(x=>(
+                      <div key={x.l} style={{textAlign:"center"}}>
+                        <div style={{fontSize:7,color:C.muted,marginBottom:2,lineHeight:1.3}}>{x.l}</div>
+                        <div style={{fontSize:11,fontWeight:700,color:x.c}}>{x.v}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* PSU (2028년) */}
+                {yr===2028&&d.psuNet>0&&(
+                  <div style={{background:"rgba(176,96,255,0.08)",border:"1px solid rgba(176,96,255,0.2)",
+                    borderRadius:9,padding:"10px 12px",marginBottom:8}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <div style={{fontSize:9,color:C.purple,fontWeight:700}}>
+                        📈 PSU 수령 (2028~2030년 3년 합계)
+                        <div style={{fontSize:8,color:C.muted,fontWeight:400}}>배수 {d.pM2}배 · 2028년 주가 {Math.round(d.psuF2/10000)}만원</div>
+                      </div>
+                      <div style={{fontSize:18,fontWeight:900,color:C.purple}}>{fw(d.psuNet)}</div>
+                    </div>
+                  </div>
+                )}
+
+                {/* 연간 실질 수령 요약 */}
+                <div style={{background:"rgba(0,0,0,0.25)",borderRadius:9,padding:"10px 12px"}}>
+                  <div style={{fontSize:9,color:C.muted,fontWeight:700,marginBottom:6}}>💰 연간 실질 수령 계산</div>
+                  {[
+                    {l:`월 실수령 × 12`,   v:annualBase,  c:C.text,   sign:"+"},
+                    {l:"성과금 세후",       v:annualBonus, c:C.cyan,   sign:"+"},
+                    ...(yr===2028&&annualPsu>0?[{l:"PSU 세후(3년)",v:annualPsu,c:C.purple,sign:"+"}]:[]),
+                    {l:"건보료 연말정산",   v:-extraTotal, c:C.red,    sign:"-"},
+                  ].map(x=>(
+                    <div key={x.l} style={{display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:3}}>
+                      <span style={{color:C.muted}}>{x.sign} {x.l}</span>
+                      <span style={{color:x.c,fontWeight:600}}>{x.v<0?"-":""}{fw(Math.abs(x.v))}</span>
+                    </div>
+                  ))}
+                  <div style={{borderTop:`1px solid ${C.bd}`,paddingTop:6,display:"flex",justifyContent:"space-between"}}>
+                    <span style={{color:C.muted,fontWeight:700,fontSize:11}}>= 연간 실질 수령</span>
+                    <span style={{color:yc,fontWeight:900,fontSize:16}}>{fw(annualReal)}</span>
+                  </div>
+                </div>
+              </Card>
+            );
+          })}
+
+          {/* 25가지 조합 총수령 매트릭스 요약 */}
+          <Card style={{marginBottom:10}}>
+            <Label>🔀 25가지 시나리오 2026년 연간 총수령 비교</Label>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"separate",borderSpacing:2,fontSize:10}}>
+                <thead>
+                  <tr>
+                    <th style={{padding:"4px 2px",fontSize:8,color:C.muted}}></th>
+                    {STK_KEYS.map(sk=>(
+                      <th key={sk} style={{padding:"4px 2px",fontSize:8,
+                        color:stkColor(sk),textAlign:"center",fontWeight:700}}>
+                        {sk==="bull2"?"🚀🚀":sk==="bull"?"🚀":sk==="bear"?"🐻":sk==="bear2"?"🐻🐻":"📊"}
+                        <div style={{fontSize:7,color:C.muted,fontWeight:400}}>
+                          {STK_SCENARIOS[sk].gr>0?`+${STK_SCENARIOS[sk].gr}%`:STK_SCENARIOS[sk].gr===0?"0%":`${STK_SCENARIOS[sk].gr}%`}
+                        </div>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {DS_KEYS.map(dk2=>(
+                    <tr key={dk2}>
+                      <td style={{padding:"2px",fontSize:8,fontWeight:700,
+                        color:dsColor(dk2),whiteSpace:"nowrap"}}>
+                        {dk2==="bull2"?"🚀🚀":dk2==="bull"?"🚀":dk2==="bear"?"🐻":dk2==="bear2"?"🐻🐻":"📊"}
+                        <div style={{fontSize:7,color:C.muted,fontWeight:400}}>
+                          {dk2==="bull2"?"500조":dk2==="bull"?"400조":dk2==="bear"?"280조":dk2==="bear2"?"180조":"360조"}
+                        </div>
+                      </td>
+                      {STK_KEYS.map(sk=>{
+                        const d=calcM(dk2,sk,2026);
+                        const isCur=dk2===salDs&&sk===salStk;
+                        const total=d.net*12+d.row.tn;
+                        return(
+                          <td key={sk} style={{padding:"2px"}}>
+                            <div style={{
+                              background:isCur?"rgba(255,255,255,0.12)":"rgba(255,255,255,0.03)",
+                              border:isCur?"2px solid #fff":`1px solid ${C.bd}`,
+                              borderRadius:7,padding:"5px 2px",textAlign:"center",position:"relative"}}>
+                              {isCur&&<div style={{position:"absolute",top:-7,left:"50%",transform:"translateX(-50%)",
+                                background:"#fff",color:"#06101d",fontSize:6,fontWeight:800,
+                                borderRadius:4,padding:"1px 3px",whiteSpace:"nowrap"}}>✔</div>}
+                              <div style={{fontSize:10,fontWeight:800,color:dsColor(dk2)}}>{fs2(total)}</div>
+                              <div style={{fontSize:7,color:C.muted,marginTop:1}}>월 {fs2(d.net)}</div>
+                            </div>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{fontSize:8,color:C.muted,marginTop:6}}>연간 총수령 = 월실수령×12 + 성과금(세후) · 2026년 기준</div>
+          </Card>
+
+          <div style={{fontSize:9,color:"#4e6880",lineHeight:1.8,padding:"7px 10px",borderRadius:8,
+            background:"rgba(255,200,50,0.04)",border:"1px solid rgba(255,200,50,0.12)"}}>
+            ⚠️ 소득세 간이세율(부양가족 0명) · 연말정산 후 환급/추납 가능 · 건보료 연말정산(4월) 성과금 반영 추가 부과 · 참고용
+          </div>
+        </>);
+      })()}
+
+            {tab==="a"&&(()=>{
+        const aptStkGrVal=aptStkGr!==null?aptStkGr:agr; // null이면 자사주 탭 agr 연동
+        const aptAt=(p,y)=>Math.round(p*(1+aptGr/100)**(y-2026));
+        const sAt=y=>Math.round(stkNow*(1+aptStkGrVal/100)**(y-2026));
+        // 부동산탭 전용 현금흐름 (aptStkGrVal 반영)
+        const aptCash={};
+        yd.forEach(r=>{const py=r.yr+1,ts=Math.floor(r.sn/stkNow),s1=Math.floor(ts/3),s2=Math.floor(ts/3),s3=ts-s1-s2;
+          aptCash[py]=(aptCash[py]||0)+r.on+s1*sAt(py);aptCash[py+1]=(aptCash[py+1]||0)+s2*sAt(py+1);aptCash[py+2]=(aptCash[py+2]||0)+s3*sAt(py+2);});
+        [[2028,pNA[0]],[2029,pNA[1]],[2030,pNA[2]]].forEach(([y,v])=>{aptCash[y]=(aptCash[y]||0)+(pM>0?v:0);});
+        let aptRun=0;const aptCum={};aptYrs.forEach(y=>{aptRun+=(aptCash[y]||0);aptCum[y]=aptRun;});
+        const aptFcum=aptCum[2033]||0;
+        const aptMxC=Math.max(...aptYrs.map(y=>aptCash[y]||0),1);
+        return(<>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+            <Card>
+              <Label>📈 삼성전자 주가 상승률</Label>
+              {/* 자사주 탭 연동 안내 */}
+              <div style={{marginBottom:7,padding:"5px 8px",borderRadius:6,
+                background:aptStkGr===null?"rgba(0,216,255,0.08)":"rgba(255,255,255,0.04)",
+                border:`1px solid ${aptStkGr===null?"rgba(0,216,255,0.25)":C.bd}`,fontSize:9}}>
+                {aptStkGr===null
+                  ?<span style={{color:C.cyan}}>🔗 자사주 탭 연동 중 ({agr>0?"+":""}{agr}%) &nbsp;
+                    <button onClick={()=>setAptStkGr(agr)} style={{fontSize:8,color:C.muted,background:"rgba(255,255,255,0.1)",border:`1px solid ${C.bd}`,borderRadius:5,padding:"1px 6px",cursor:"pointer"}}>개별 설정</button>
+                  </span>
+                  :<span style={{color:C.muted}}>개별 설정 중 &nbsp;
+                    <button onClick={()=>setAptStkGr(null)} style={{fontSize:8,color:C.cyan,background:"rgba(0,216,255,0.1)",border:`1px solid rgba(0,216,255,0.3)`,borderRadius:5,padding:"1px 6px",cursor:"pointer"}}>🔗 자사주 탭 연동</button>
+                  </span>
+                }
+              </div>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:5,fontSize:11}}>
+                <span style={{color:C.sub}}>{stkNow.toLocaleString()}원</span>
+                <span style={{fontSize:18,fontWeight:800,color:aptStkGrVal>0?C.cyan:aptStkGrVal<0?C.red:C.muted}}>{aptStkGrVal>0?"+":""}{aptStkGrVal}%</span>
+              </div>
+              <input type="range" min={-20} max={50} step={5} value={aptStkGrVal}
+                onChange={e=>{setAptStkGr(+e.target.value);}}
+                style={{width:"100%",accentColor:aptStkGrVal>=0?C.cyan:C.red,height:4,cursor:"pointer",marginBottom:4}}/>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:C.muted,marginBottom:6}}>
+                <span>-20%</span><span>0%</span><span>+25%</span><span>+50%</span>
+              </div>
+              <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>
+                {[{l:"🚀 낙관",r:12},{l:"📊 기본",r:8},{l:"🐻 비관",r:0},{l:"+20%",r:20},{l:"+30%",r:30}].map(s=>(
+                  <button key={s.r} onClick={()=>setAptStkGr(s.r)} style={{padding:"3px 7px",borderRadius:10,fontSize:9,fontWeight:600,cursor:"pointer",
+                    border:aptStkGrVal===s.r?`1.5px solid ${s.r===12?C.green:s.r===8?C.cyan:s.r===0?C.red:C.cyan}`:`1px solid ${C.bd}`,
+                    background:aptStkGrVal===s.r?"rgba(0,216,255,0.1)":"rgba(255,255,255,0.03)",
+                    color:aptStkGrVal===s.r?s.r===12?C.green:s.r===0?C.red:C.cyan:C.muted}}>{s.l}</button>
+                ))}
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:3}}>
+                {[2027,2029,2031,2033].map(y=>{const px=sAt(y),chg=Math.round((px-stkNow)/stkNow*100);return(
+                  <div key={y} style={{textAlign:"center",background:"rgba(0,0,0,0.25)",borderRadius:5,padding:"4px 2px"}}>
+                    <div style={{fontSize:8,color:C.muted}}>{y}</div>
+                    <div style={{fontSize:10,fontWeight:700,color:C.cyan}}>{Math.round(px/10000)}만</div>
+                    <div style={{fontSize:8,color:chg>=0?C.cyan:C.red}}>{chg>0?"+":""}{chg}%</div>
+                  </div>
+                );})}
+              </div>
+            </Card>
+            <Card>
+              <Label>🏠 부동산 상승률</Label>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:5,fontSize:11}}>
+                <span style={{color:C.sub}}>서울 2025: +9%</span>
+                <span style={{fontSize:18,fontWeight:800,color:aptGr>0?C.orange:aptGr<0?C.red:C.muted}}>{aptGr>0?"+":""}{aptGr}%</span>
+              </div>
+              <input type="range" min={-5} max={15} step={1} value={aptGr} onChange={e=>setAptGr(+e.target.value)} style={{width:"100%",accentColor:C.orange,height:4,cursor:"pointer",marginBottom:7}}/>
+              <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>
+                {[{l:"하락-3%",r:-3},{l:"보합0%",r:0},{l:"완만3%",r:3},{l:"상승5%",r:5},{l:"급등10%",r:10}].map(s=>(
+                  <button key={s.r} onClick={()=>setAptGr(s.r)} style={{padding:"3px 8px",borderRadius:10,fontSize:9,fontWeight:600,cursor:"pointer",border:aptGr===s.r?`1.5px solid ${C.orange}`:`1px solid ${C.bd}`,background:aptGr===s.r?"rgba(255,144,48,0.1)":"rgba(255,255,255,0.03)",color:aptGr===s.r?C.orange:C.muted}}>{s.l}</button>
+                ))}
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:3}}>
+                {[2027,2029,2031,2033].map(y=>{const px=aptAt(13e8,y);return(
+                  <div key={y} style={{textAlign:"center",background:"rgba(0,0,0,0.25)",borderRadius:5,padding:"4px 2px"}}>
+                    <div style={{fontSize:8,color:C.muted}}>{y}</div>
+                    <div style={{fontSize:10,fontWeight:700,color:C.orange}}>{(px/1e8).toFixed(1)}억</div>
+                    <div style={{fontSize:8,color:C.muted}}>노원</div>
+                  </div>
+                );})}
+              </div>
+            </Card>
+          </div>
+
+          <Card style={{marginBottom:12}}>
+            <Label>🏦 LTV · DSR 대출 한도 자동 계산</Label>
+            {/* 입력 */}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+              {[
+                {l:"보유 현금(억)",v:cash,set:setCash,c:C.yellow,min:0,max:100,step:0.5},
+                {l:"금리(%)",v:loanRate,set:setLoanRate,c:C.orange,min:1,max:10,step:0.1},
+                {l:"대출기간(년)",v:loanYears,set:setLoanYears,c:C.cyan,min:10,max:40,step:5},
+              ].map(x=>(
+                <div key={x.l}>
+                  <div style={{fontSize:9,color:C.muted,marginBottom:4}}>{x.l}</div>
+                  <input type="number" inputMode="numeric" min={x.min} max={x.max} step={x.step} value={x.v}
+                    onChange={e=>x.set(+e.target.value)}
+                    style={{background:"rgba(255,255,255,0.07)",border:`1px solid ${C.bd}`,borderRadius:8,
+                      color:x.c,fontSize:16,fontWeight:800,padding:"6px 8px",width:"100%",boxSizing:"border-box",textAlign:"right"}}/>
+                </div>
+              ))}
+            </div>
+            {/* 규제지역 선택 */}
+            <div style={{marginBottom:10}}>
+              <div style={{fontSize:9,color:C.muted,marginBottom:5}}>규제지역 구분</div>
+              <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                {[
+                  {l:"투기과열(강남·용산)",ltv:40,dsr:40},
+                  {l:"조정대상지역",       ltv:50,dsr:40},
+                  {l:"기타지역",           ltv:70,dsr:40},
+                  {l:"비규제지역",         ltv:80,dsr:40},
+                ].map(z=>(
+                  <button key={z.l} onClick={()=>setRegion(z)} style={{
+                    padding:"5px 10px",borderRadius:10,fontSize:10,fontWeight:600,cursor:"pointer",
+                    border:region.l===z.l?`1.5px solid ${C.blue}`:`1px solid ${C.bd}`,
+                    background:region.l===z.l?"rgba(20,153,255,0.12)":"rgba(255,255,255,0.03)",
+                    color:region.l===z.l?C.blue:C.muted}}>{z.l}<br/>
+                    <span style={{fontSize:8,color:region.l===z.l?C.cyan:C.muted}}>LTV {z.ltv}% · DSR {z.dsr}%</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            {/* LTV/DSR 결과 */}
+            {(()=>{
+              const annualSal=(sal[2026]||base)*10000;
+              // OPI1 2년 평균 (2026·2027년) × 50% 은행 인정
+              const opi2026=yd.find(r=>r.yr===2026)?.on||0;
+              const opi2027=yd.find(r=>r.yr===2027)?.on||0;
+              const opiAvg=Math.round((opi2026+opi2027)/2);
+              const opiRecog=Math.round(opiAvg*0.5); // 은행 인정분 50%
+              const dsrIncome=annualSal+opiRecog; // DSR 산정 소득
+              // 월 원리금 계산 함수
+              const mPay=(principal,rate,yrs)=>{
+                const r=rate/100/12,n=yrs*12;
+                if(r===0)return principal/n;
+                return Math.round(principal*r*Math.pow(1+r,n)/(Math.pow(1+r,n)-1));
+              };
+              // DSR 역산: 최대 대출액
+              const maxMonthly=Math.round(dsrIncome*region.dsr/100/12);
+              const r=loanRate/100/12,n=loanYears*12;
+              const dsrLoan=r>0?Math.round(maxMonthly*(Math.pow(1+r,n)-1)/(r*Math.pow(1+r,n))):maxMonthly*n;
+              const refPrice=13e8;
+              const ltvLoan=Math.round(refPrice*region.ltv/100);
+              const actualLoan=Math.min(ltvLoan,dsrLoan);
+              const monthly=mPay(actualLoan,loanRate,loanYears);
+              const dsrRatio=Math.round(monthly*12/dsrIncome*100);
+              return(
+                <div>
+                  {/* 소득 산정 내역 */}
+                  <div style={{marginBottom:10,padding:"8px 10px",borderRadius:8,
+                    background:"rgba(0,240,144,0.06)",border:"1px solid rgba(0,240,144,0.2)"}}>
+                    <div style={{fontSize:9,color:C.green,fontWeight:700,marginBottom:5}}>💡 DSR 산정 소득 (연봉 + OPI1 현금 인정분)</div>
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:6,textAlign:"center"}}>
+                      {[
+                        {l:"연봉",            v:fw(annualSal),      c:C.yellow},
+                        {l:"OPI1 2년평균",     v:fw(opiAvg),         c:C.cyan},
+                        {l:"은행인정(×50%)",  v:`+${fw(opiRecog)}`, c:C.green},
+                        {l:"DSR 산정소득",    v:fw(dsrIncome),      c:C.green},
+                      ].map(x=>(
+                        <div key={x.l}>
+                          <div style={{fontSize:8,color:C.muted,marginBottom:2}}>{x.l}</div>
+                          <div style={{fontSize:11,fontWeight:800,color:x.c}}>{x.v}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{fontSize:8,color:C.muted,marginTop:5}}>
+                      ※ OPI1(현금)만 50% 인정 · OPI2(자사주)·PSU는 은행 소득 미인정
+                    </div>
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+                    <div style={{background:"rgba(20,153,255,0.08)",border:"1px solid rgba(20,153,255,0.25)",borderRadius:9,padding:"10px 12px"}}>
+                      <div style={{fontSize:9,color:C.muted,marginBottom:3}}>LTV 한도 ({region.ltv}%)</div>
+                      <div style={{fontSize:16,fontWeight:800,color:C.blue}}>{fw(ltvLoan)}</div>
+                      <div style={{fontSize:9,color:C.muted,marginTop:2}}>노원구 13억 기준</div>
+                    </div>
+                    <div style={{background:"rgba(0,216,255,0.08)",border:"1px solid rgba(0,216,255,0.25)",borderRadius:9,padding:"10px 12px"}}>
+                      <div style={{fontSize:9,color:C.muted,marginBottom:3}}>DSR 한도 ({region.dsr}%)</div>
+                      <div style={{fontSize:16,fontWeight:800,color:C.cyan}}>{fw(dsrLoan)}</div>
+                      <div style={{fontSize:9,color:C.muted,marginTop:2}}>산정소득 {fw(dsrIncome)} 기준</div>
+                    </div>
+                  </div>
+                  <div style={{background:"rgba(0,0,0,0.25)",borderRadius:9,padding:"10px 12px",marginBottom:10}}>
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,textAlign:"center"}}>
+                      {[
+                        {l:"실질 대출 한도",v:fw(actualLoan),c:C.green,sub:"min(LTV,DSR)"},
+                        {l:"월 상환액",v:fw(monthly),c:C.orange,sub:`DSR ${dsrRatio}% 적용`},
+                        {l:"총 매입 가능",v:fw(cash*1e8+actualLoan),c:C.yellow,sub:"현금+대출"},
+                      ].map(x=>(
+                        <div key={x.l}>
+                          <div style={{fontSize:9,color:C.muted,marginBottom:2}}>{x.l}</div>
+                          <div style={{fontSize:13,fontWeight:800,color:x.c}}>{x.v}</div>
+                          <div style={{fontSize:8,color:C.muted,marginTop:1}}>{x.sub}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  {/* 각 아파트별 LTV/DSR 적용 대출 한도 */}
+                  <div style={{fontSize:9,color:C.muted,marginBottom:6,fontWeight:700}}>📋 지역별 LTV 적용 대출 한도</div>
+                  <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                    {APTS.map(a=>{
+                      const aLtv=Math.round(a.p*region.ltv/100);
+                      const aLoan=Math.min(aLtv,dsrLoan);
+                      const aMon=mPay(aLoan,loanRate,loanYears);
+                      const aDsr=Math.round(aMon*12/annualSal*100);
+                      const canBuy=cash*1e8+aLoan>=a.p;
+                      const need=a.p-(cash*1e8+aLoan);
+                      return(
+                        <div key={a.a} style={{display:"flex",alignItems:"center",gap:8,padding:"5px 8px",
+                          borderRadius:7,background:canBuy?"rgba(0,240,144,0.06)":"rgba(255,255,255,0.02)",
+                          border:`1px solid ${canBuy?"rgba(0,240,144,0.2)":C.bd}`}}>
+                          <span style={{fontSize:10,fontWeight:700,color:a.col,minWidth:60}}>{a.e} {a.a}</span>
+                          <span style={{fontSize:9,color:C.muted,minWidth:40}}>{(a.p/1e8).toFixed(0)}억</span>
+                          <span style={{fontSize:9,color:C.blue}}>LTV {fw(aLtv)}</span>
+                          <span style={{fontSize:9,color:C.cyan}}>→대출 {fw(aLoan)}</span>
+                          <span style={{fontSize:9,color:C.orange}}>월 {fs2(aMon)}</span>
+                          <span style={{fontSize:9,color:C.muted}}>DSR {aDsr}%</span>
+                          <span style={{marginLeft:"auto",fontSize:9,fontWeight:700,color:canBuy?C.green:C.red}}>
+                            {canBuy?`✅ 현금만으로 가능`:`❌ ${fw(need)} 부족`}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div style={{marginTop:8,fontSize:9,color:C.muted,padding:"5px 8px",borderRadius:6,background:"rgba(255,200,50,0.05)",border:"1px solid rgba(255,200,50,0.12)"}}>
+                    ⚠️ 성과급 누적 미포함 기준 · 실제 DSR은 기존 부채 합산 · 스트레스금리 미적용 · 참고용
+                  </div>
+                </div>
+              );
+            })()}
+          </Card>
+
+          <Card ac="green" style={{marginBottom:12}}>
+            <Label c={C.green}>연도별 현금 수령 + 누적</Label>
+            {aptYrs.map(y=>{const v=aptCash[y]||0,cv=aptCum[y]||0,bw=Math.round(v/aptMxC*100),cbw=Math.round(cv/aptFcum*100);return(
+              <div key={y} style={{marginBottom:8}}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:2,fontSize:10}}>
+                  <span style={{color:C.cyan,fontWeight:700}}>{y}년</span>
+                  <div><span style={{color:C.green,fontWeight:700}}>{fw(v)}</span><span style={{color:C.muted,fontSize:9,marginLeft:6}}>누적 <strong style={{color:C.yellow}}>{fw(cv)}</strong></span></div>
+                </div>
+                <div style={{position:"relative",height:7,background:"rgba(255,255,255,0.05)",borderRadius:4,overflow:"hidden",marginBottom:2}}>
+                  <div style={{position:"absolute",left:0,top:0,height:"100%",width:`${bw}%`,background:"linear-gradient(90deg,#00d8ff,#00f090)",borderRadius:4}}/>
+                </div>
+                <div style={{position:"relative",height:4,background:"rgba(255,255,255,0.04)",borderRadius:3,overflow:"hidden"}}>
+                  <div style={{position:"absolute",left:0,top:0,height:"100%",width:`${cbw}%`,background:"linear-gradient(90deg,rgba(255,208,60,.5),rgba(255,208,60,.9))",borderRadius:3}}/>
+                </div>
+              </div>
+            );})}
+          </Card>
+
+          <Card style={{marginBottom:12}}>
+            <Label>📅 연도별 매입 가능 지역 (2027~2033)</Label>
+            <div style={{fontSize:9,color:C.muted,marginBottom:10,padding:"5px 8px",borderRadius:6,background:"rgba(0,216,255,0.06)",border:"1px solid rgba(0,216,255,0.14)"}}>
+              매입 기준 = 현금({cash}억) + LTV/DSR 대출 한도 + 성과급 누적 ≥ 해당 연도 아파트 시세
+            </div>
+            {aptYrs.map(y=>{
+              // LTV/DSR 대출 한도 계산 (각 아파트 가격 기준)
+              const annualSal=(sal[2026]||base)*10000;
+              const opi2026=yd.find(r=>r.yr===2026)?.on||0;
+              const opi2027=yd.find(r=>r.yr===2027)?.on||0;
+              const opiRecog2=Math.round((opi2026+opi2027)/2*0.5);
+              const dsrIncome2=annualSal+opiRecog2;
+              const r2=loanRate/100/12,n2=loanYears*12;
+              const maxM=Math.round(dsrIncome2*region.dsr/100/12);
+              const dsrL=r2>0?Math.round(maxM*(Math.pow(1+r2,n2)-1)/(r2*Math.pow(1+r2,n2))):maxM*n2;
+              const getLoan=p=>Math.min(Math.round(p*region.ltv/100),dsrL);
+              // 성과급 누적 포함 총 자금 (아파트별로 LTV가 다르므로 각각 계산)
+              const cumBon=aptCum[y]||0;
+              const ok=APTS.filter(a=>{const futP=aptAt(a.p,y);return cash*1e8+getLoan(futP)+cumBon>=futP;});
+              const no=APTS.filter(a=>{const futP=aptAt(a.p,y);return cash*1e8+getLoan(futP)+cumBon<futP;}).map(a=>{const futP=aptAt(a.p,y);return{...a,gap:futP-(cash*1e8+getLoan(futP)+cumBon)};}).sort((a,b)=>a.gap-b.gap);
+              const bf=cash*1e8+getLoan(13e8)+cumBon; // 총 자금 표시용
+              return(
+                <div key={y} style={{background:"rgba(255,255,255,0.02)",border:`1px solid ${ok.length>0?"rgba(0,240,144,0.22)":C.bd}`,borderRadius:10,padding:"12px 14px",marginBottom:8}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:ok.length>0?8:0}}>
+                    <div>
+                      <span style={{fontSize:14,fontWeight:800,color:ok.length>0?C.green:C.muted}}>{y}년</span>
+                      <span style={{fontSize:9,color:C.muted,marginLeft:8}}>총 자금 <strong style={{color:C.cyan}}>{fw(bf)}</strong></span>
+                    </div>
+                    <span style={{fontSize:11,fontWeight:700,color:ok.length>0?C.green:C.muted}}>{ok.length>0?`✅ ${ok.length}개`:"❌ 해당없음"}</span>
+                  </div>
+                  {ok.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:no.length>0?8:0}}>
+                    {ok.map(a=><a key={a.a} href={a.url} target="_blank" rel="noopener noreferrer"
+                      style={{background:"rgba(0,240,144,0.09)",border:"1px solid rgba(0,240,144,0.28)",
+                        borderRadius:7,padding:"4px 9px",fontSize:10,textDecoration:"none",display:"block",cursor:"pointer"}}>
+                      <span style={{color:a.col,fontWeight:700}}>{a.e} {a.a}</span>
+                      <span style={{color:C.muted,fontSize:9,marginLeft:4}}>{fw(aptAt(a.p,y))}</span>
+                      <div style={{fontSize:8,color:C.cyan,marginTop:1}}>📎 {a.apt} →</div>
+                    </a>)}
+                  </div>}
+                  {no.length>0&&<div>
+                    <div style={{fontSize:9,color:C.muted,marginBottom:4}}>📍 부족 (가까운 순)</div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+                      {no.slice(0,4).map(a=><a key={a.a} href={a.url} target="_blank" rel="noopener noreferrer"
+                        style={{background:"rgba(255,255,255,0.02)",border:`1px solid ${C.bd}`,borderRadius:7,padding:"3px 8px",fontSize:9,textDecoration:"none",display:"block"}}>
+                        <span style={{color:a.col}}>{a.a}</span>
+                        <span style={{color:C.red,marginLeft:3}}>-{fw(a.gap)}</span>
+                        <div style={{fontSize:7,color:C.muted,marginTop:1}}>{a.apt}</div>
+                      </a>)}
+                    </div>
+                  </div>}
+                </div>
+              );
+            })}
+          </Card>
+          <div style={{fontSize:9,color:"#4e6880",lineHeight:1.7,padding:"7px 10px",borderRadius:8,background:"rgba(255,200,50,0.04)",border:"1px solid rgba(255,200,50,0.12)"}}>
+            ⚠️ 시세 2026.06 기준 84㎡ 추정치 · 취득세·중개수수료 미포함 · 대출 DSR·LTV 규제 별도
+          </div>
+        </>);
+      })()}
+
+      {/* ══ 시나리오 비교 매트릭스 ══ */}
+      {tab==="mx"&&(()=>{
+        const maxTotal=Math.max(...DS_KEYS.flatMap(dk2=>STK_KEYS.map(sk=>matrix[dk2][sk].total)),1);
+        const minTotal=Math.min(...DS_KEYS.flatMap(dk2=>STK_KEYS.map(sk=>matrix[dk2][sk].total)));
+        // 현재 선택된 시나리오 감지
+        const curDs=DS_KEYS.includes(scenario)?scenario:null;
+        const curStk=agr===20?"bull2":agr===12?"bull":agr===8?"base":agr===0?"bear":agr===-10?"bear2":null;
+        const isCurCell=(dk2,sk)=>dk2===curDs&&sk===curStk;
+        const cellBg=(total)=>{
+          const r=(total-minTotal)/(maxTotal-minTotal);
+          if(darkMode){
+            if(r>0.66)return"rgba(0,240,144,0.15)";
+            if(r>0.33)return"rgba(0,216,255,0.1)";
+            return"rgba(255,80,80,0.1)";
+          } else {
+            if(r>0.66)return"rgba(0,140,70,0.12)";
+            if(r>0.33)return"rgba(0,100,180,0.08)";
+            return"rgba(200,50,50,0.08)";
+          }
+        };
+        const cellBd=(total)=>{
+          const r=(total-minTotal)/(maxTotal-minTotal);
+          if(r>0.66)return darkMode?"rgba(0,240,144,0.4)":"rgba(0,140,70,0.4)";
+          if(r>0.33)return darkMode?"rgba(0,216,255,0.3)":"rgba(0,100,180,0.3)";
+          return darkMode?"rgba(255,80,80,0.3)":"rgba(200,50,50,0.3)";
+        };
+        const cellColor=(total)=>{
+          const r=(total-minTotal)/(maxTotal-minTotal);
+          // 라이트/다크 모두 배경과 충분히 대비되는 진한 색상
+          if(r>0.66)return darkMode?C.green:"#005a28";
+          if(r>0.33)return darkMode?C.cyan:"#004a7c";
+          return darkMode?C.red:"#8b0000";
+        };
+        // 현재선택 셀 글자색: 라이트모드에서 흰색 대신 진한색
+        const curTextColor=darkMode?"#ffffff":C.text;
+        return(<>
+          {/* 설명 */}
+          <Card style={{marginBottom:12}}>
+            <div style={{fontSize:11,color:C.text,fontWeight:700,marginBottom:6}}>
+              영업이익 시나리오 × 주가 시나리오 — 9가지 조합 총 수령액 비교
+            </div>
+            <div style={{fontSize:10,color:C.muted,lineHeight:1.7}}>
+              현재 입력값 기준 · OPI1(현금) + 자사주 매도 + PSU 세후 합산
+              <br/>사업부: <strong style={{color:C.cyan}}>{{memory:"메모리",lsi:"시스템LSI",foundry:"파운드리",support:"지원·공통"}[dk]}</strong>
+              &nbsp;·&nbsp;연봉: <strong style={{color:C.yellow}}>{base.toLocaleString()}만원</strong>
+              &nbsp;·&nbsp;PSU: <strong style={{color:C.purple}}>{PSU_CL[psuCl].label}</strong>
+            </div>
+          </Card>
+
+          {/* 3×3 매트릭스 */}
+          <Card style={{marginBottom:12,padding:"14px 10px"}}>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"separate",borderSpacing:4}}>
+                <thead>
+                  <tr>
+                    <th style={{padding:"8px 6px",fontSize:10,color:C.muted,textAlign:"center",minWidth:80}}></th>
+                    {STK_KEYS.map(sk=>(
+                      <th key={sk} style={{padding:"5px 3px",fontSize:8,
+                        color:stkColor(sk),
+                        textAlign:"center",fontWeight:700,minWidth:70,
+                        background:curStk===sk?"rgba(255,255,255,0.07)":"transparent",
+                        borderRadius:8}}>
+                        {sk==="bull2"?"🚀🚀 슈퍼낙관":sk==="bull"?"🚀 낙관":sk==="bear"?"🐻 비관":sk==="bear2"?"🐻🐻 최악":"📊 기본"}
+                        {curStk===sk&&<span style={{marginLeft:3,fontSize:7,color:"#fff",background:"rgba(255,255,255,0.2)",borderRadius:4,padding:"1px 4px"}}>선택</span>}
+                        <div style={{fontSize:7,color:C.muted,fontWeight:400,marginTop:1}}>
+                          {STK_SCENARIOS[sk].gr>0?"+":""}{STK_SCENARIOS[sk].gr}%
+                        </div>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {DS_KEYS.map(dk2=>(
+                    <tr key={dk2}>
+                      <td style={{padding:"6px",textAlign:"center",verticalAlign:"middle",
+                        background:curDs===dk2?"rgba(255,255,255,0.07)":"transparent",borderRadius:8}}>
+                        <div style={{fontSize:9,fontWeight:700,color:dsColor(dk2)}}>
+                          {dk2==="bull2"?"🚀🚀 슈퍼낙관":dk2==="bull"?"🚀 낙관":dk2==="bear"?"🐻 비관":dk2==="bear2"?"🐻🐻 최악":"📊 기본"}
+                          {curDs===dk2&&<span style={{marginLeft:4,fontSize:7,color:"#fff",background:"rgba(255,255,255,0.2)",borderRadius:4,padding:"1px 4px"}}>선택</span>}
+                        </div>
+                        <div style={{fontSize:7,color:C.muted,marginTop:2}}>
+                          {SCENARIOS[dk2].ds[2026]}→{SCENARIOS[dk2].ds[2027]}→{SCENARIOS[dk2].ds[2028]}조
+                        </div>
+                      </td>
+                      {STK_KEYS.map(sk=>{
+                        const cell=matrix[dk2][sk];
+                        const isMax=cell.total===maxTotal;
+                        const isMin=cell.total===minTotal;
+                        const isCur=isCurCell(dk2,sk);
+                        return(
+                          <td key={sk} style={{padding:"4px"}}>
+                            <div style={{
+                              background:isCur?darkMode?"rgba(255,255,255,0.15)":"rgba(0,0,0,0.08)":cellBg(cell.total),
+                              border:isCur?`3px solid ${darkMode?"#ffffff":C.blue}`:`1.5px solid ${cellBd(cell.total)}`,
+                              borderRadius:10,padding:"10px 8px",textAlign:"center",
+                              position:"relative",
+                              boxShadow:isCur?"0 0 16px rgba(255,255,255,0.3)":"none"}}>
+                              {isMax&&!isCur&&<div style={{position:"absolute",top:-8,right:-4,fontSize:14}}>👑</div>}
+                              {isMin&&!isCur&&<div style={{position:"absolute",top:-8,right:-4,fontSize:14}}>⚠️</div>}
+                              {isCur&&<div style={{position:"absolute",top:-10,left:"50%",transform:"translateX(-50%)",
+                                background:"#fff",color:"#06101d",fontSize:8,fontWeight:800,
+                                borderRadius:6,padding:"2px 6px",whiteSpace:"nowrap"}}>✔ 현재 선택</div>}
+                              <div style={{fontSize:16,fontWeight:900,color:isCur?curTextColor:cellColor(cell.total),lineHeight:1}}>
+                                {fw(cell.total)}
+                              </div>
+                              <div style={{borderTop:`1px solid ${C.bd}`,margin:"6px 0 4px"}}/>
+                              <div style={{fontSize:8,color:C.sub,lineHeight:1.8}}>
+                                <div>OPI1 <span style={{color:C.cyan}}>{fs2(cell.opiNet)}</span></div>
+                                <div>OPI2 <span style={{color:C.yellow}}>{fs2(cell.stockSell)}</span></div>
+                                <div>PSU <span style={{color:C.purple}}>{fs2(cell.psuNet)}</span></div>
+                              </div>
+                            </div>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+
+          {/* 최대-최소 차이 요약 */}
+          <Card style={{marginBottom:12}}>
+            <Label>👑 최선 vs ⚠️ 최악 비교</Label>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+              <div style={{background:darkMode?"rgba(0,240,144,0.08)":"rgba(0,140,70,0.07)",border:darkMode?"1px solid rgba(0,240,144,0.3)":"1px solid rgba(0,140,70,0.3)",borderRadius:10,padding:"12px",textAlign:"center"}}>
+                <div style={{fontSize:10,color:C.muted,marginBottom:3}}>👑 최선 (DS낙관 × 주가낙관)</div>
+                <div style={{fontSize:24,fontWeight:900,color:C.green}}>{fw(matrix.bull.bull.total)}</div>
+                <div style={{fontSize:9,color:C.muted,marginTop:4,lineHeight:1.6}}>
+                  OPI1 {fw(matrix.bull.bull.opiNet)} · 자사주 {fw(matrix.bull.bull.stockSell)} · PSU {fw(matrix.bull.bull.psuNet)}
+                </div>
+              </div>
+              <div style={{background:darkMode?"rgba(255,80,80,0.08)":"rgba(180,40,40,0.07)",border:darkMode?"1px solid rgba(255,80,80,0.3)":"1px solid rgba(180,40,40,0.3)",borderRadius:10,padding:"12px",textAlign:"center"}}>
+                <div style={{fontSize:10,color:C.muted,marginBottom:3}}>⚠️ 최악 (DS비관 × 주가비관)</div>
+                <div style={{fontSize:24,fontWeight:900,color:C.red}}>{fw(matrix.bear.bear.total)}</div>
+                <div style={{fontSize:9,color:C.muted,marginTop:4,lineHeight:1.6}}>
+                  OPI1 {fw(matrix.bear.bear.opiNet)} · 자사주 {fw(matrix.bear.bear.stockSell)} · PSU {fw(matrix.bear.bear.psuNet)}
+                </div>
+              </div>
+            </div>
+            <div style={{background:"rgba(0,0,0,0.2)",borderRadius:9,padding:"10px 14px"}}>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,textAlign:"center"}}>
+                {[
+                  {l:"최선 vs 최악 차이",v:fw(maxTotal-minTotal),c:C.yellow},
+                  {l:"기본 시나리오",v:fw(matrix.base.base.total),c:C.cyan},
+                  {l:"최선 대비 최악",v:Math.round(minTotal/maxTotal*100)+"%",c:C.red},
+                ].map(x=>(
+                  <div key={x.l}>
+                    <div style={{fontSize:9,color:C.muted,marginBottom:2}}>{x.l}</div>
+                    <div style={{fontSize:15,fontWeight:800,color:x.c}}>{x.v}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </Card>
+
+          {/* 항목별 시나리오 바 차트 */}
+          <Card style={{marginBottom:12}}>
+            <Label>항목별 기여도 비교</Label>
+            {/* OPI1/OPI2: DS 영업이익별 단순 막대 */}
+            {[
+              {l:"OPI1 (현금·세후)",  key:"opiNet",    c:C.cyan,   note:"DS 영업이익에만 연동"},
+              {l:"OPI2 매도 (세후)",  key:"stockSell", c:C.yellow, note:"DS × 주가 조합 연동"},
+            ].map(item=>{
+              const vals=DS_KEYS.map(dk2=>matrix[dk2]["base"][item.key]);
+              const maxV=Math.max(...vals,1);
+              return(
+                <div key={item.key} style={{marginBottom:14}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                    <div style={{fontSize:10,color:item.c,fontWeight:700}}>{item.l}</div>
+                    <div style={{fontSize:8,color:C.muted}}>{item.note}</div>
+                  </div>
+                  {DS_KEYS.map(dk2=>{
+                    const v=matrix[dk2]["base"][item.key];
+                    const bw=Math.round(v/maxV*100);
+                    const dc=dsColor(dk2);
+                    const lbl=dk2==="bull2"?"🚀🚀":dk2==="bull"?"🚀":dk2==="bear"?"🐻":dk2==="bear2"?"🐻🐻":"📊";
+                    const lblFull=dk2==="bull2"?"슈퍼낙관":dk2==="bull"?"낙관":dk2==="bear"?"비관":dk2==="bear2"?"최악":"기본";
+                    return(
+                      <div key={dk2} style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+                        <div style={{fontSize:9,color:dc,width:62,flexShrink:0,fontWeight:600}}>{lbl} {lblFull}</div>
+                        <div style={{flex:1}}>
+                          <div style={{height:16,background:"rgba(255,255,255,0.04)",borderRadius:4,overflow:"hidden"}}>
+                            <div style={{height:"100%",width:`${bw}%`,background:item.c,
+                              opacity:dk2==="bull2"?1:dk2==="bull"?0.85:dk2==="bear"?0.45:dk2==="bear2"?0.25:0.65,
+                              borderRadius:4}}/>
+                          </div>
+                        </div>
+                        <div style={{fontSize:9,color:dc,fontWeight:700,width:52,textAlign:"right",flexShrink:0}}>{fs2(v)}</div>
+                      </div>
+                    );
+                  })}
+                  <div style={{fontSize:8,color:C.muted,marginTop:2,borderTop:`1px solid ${C.bd}`,paddingTop:4}}>
+                    막대: 주가 기본(+8%) 기준
+                  </div>
+                </div>
+              );
+            })}
+            {/* PSU: 주가별 (DS 무관) */}
+            {(()=>{
+              const psuVals=STK_KEYS.map(sk=>matrix["base"][sk].psuNet);
+              const maxV=Math.max(...psuVals,1);
+              return(
+                <div style={{marginBottom:14}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                    <div style={{fontSize:10,color:C.purple,fontWeight:700}}>PSU (세후)</div>
+                    <div style={{fontSize:8,color:C.muted}}>주가에만 연동 · DS 영업이익 무관</div>
+                  </div>
+                  {STK_KEYS.map(sk=>{
+                    const v=matrix["base"][sk].psuNet;
+                    const bw=Math.round(v/maxV*100);
+                    const sc=stkColor(sk);
+                    const lbl=sk==="bull2"?"🚀🚀":sk==="bull"?"🚀":sk==="bear"?"🐻":sk==="bear2"?"🐻🐻":"📊";
+                    const lblFull=sk==="bull2"?"슈퍼낙관":sk==="bull"?"낙관":sk==="bear"?"비관":sk==="bear2"?"최악":"기본";
+                    return(
+                      <div key={sk} style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+                        <div style={{fontSize:9,color:sc,width:62,flexShrink:0,fontWeight:600}}>{lbl} {lblFull}</div>
+                        <div style={{flex:1}}>
+                          <div style={{height:16,background:"rgba(255,255,255,0.04)",borderRadius:4,overflow:"hidden"}}>
+                            <div style={{height:"100%",width:`${bw}%`,background:C.purple,
+                              opacity:sk==="bull2"?1:sk==="bull"?0.85:sk==="bear"?0.45:sk==="bear2"?0.25:0.65,
+                              borderRadius:4}}/>
+                          </div>
+                        </div>
+                        <div style={{fontSize:9,color:sc,fontWeight:700,width:52,textAlign:"right",flexShrink:0}}>{fs2(v)}</div>
+                      </div>
+                    );
+                  })}
+                  <div style={{fontSize:8,color:C.muted,marginTop:2,borderTop:`1px solid ${C.bd}`,paddingTop:4}}>
+                    막대: 영업이익 기본 시나리오 기준 · 2028.10 평가주가로 금액 확정
+                  </div>
+                </div>
+              );
+            })()}
+          </Card>
+
+          <div style={{fontSize:9,color:"#4e6880",lineHeight:1.7,padding:"7px 10px",borderRadius:8,background:"rgba(255,200,50,0.04)",border:"1px solid rgba(255,200,50,0.12)"}}>
+            ⚠️ OPI1은 DS 영업이익만 반영 · 자사주는 5년간 락업 해제 후 매도 기준 · PSU는 현재 설정 배수 적용 · 세금 누진 적용(공제 전)
+          </div>
+        </>);
+      })()}
+
+      {/* ══ 전망 탭 ══ */}
+      {tab==="fc"&&(()=>{
+        return(<>
+          <Card style={{marginBottom:12}}>
+            <Label c={C.cyan}>🌐 메모리 슈퍼사이클 — 2026.6 최신 전망</Label>
+            <div style={{fontSize:9,color:C.muted,lineHeight:1.7,marginBottom:10}}>
+              2026년 1분기 <strong style={{color:C.text}}>DS부문 53.7조원</strong>이라는 어닝 서프라이즈 이후
+              증권사들이 연이어 전망치를 큰 폭 상향 중입니다. 2분기는 더 클 것으로 예상돼요.
+            </div>
+            <div style={{padding:"10px 12px",borderRadius:9,background:darkMode?"rgba(0,216,255,0.06)":"rgba(0,150,200,0.06)",
+              border:`1px solid ${C.cyan}33`,marginBottom:10}}>
+              <div style={{fontSize:10,color:C.cyan,fontWeight:700,marginBottom:6}}>📌 1Q26 실적 (2026.4.30 발표)</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,textAlign:"center",marginBottom:8}}>
+                <div>
+                  <div style={{fontSize:8,color:C.muted}}>전사 영업이익</div>
+                  <div style={{fontSize:16,fontWeight:800,color:C.blue}}>57.2조원</div>
+                  <div style={{fontSize:8,color:C.green}}>전년比 +756%</div>
+                </div>
+                <div>
+                  <div style={{fontSize:8,color:C.muted}}>DS부문 영업이익</div>
+                  <div style={{fontSize:16,fontWeight:800,color:C.purple}}>53.7조원</div>
+                  <div style={{fontSize:8,color:C.green}}>분기 사상 최대</div>
+                </div>
+              </div>
+              <div style={{fontSize:8,color:C.muted,borderTop:`1px solid ${C.bd}`,paddingTop:6}}>
+                DRAM 영업이익 41.7조(OPM 78%) · NAND 영업이익 13.1조(OPM 65.4%) · DRAM가격 +94%, NAND가격 +93% (QoQ)
+              </div>
+            </div>
+            <div style={{padding:"10px 12px",borderRadius:9,background:darkMode?"rgba(0,240,144,0.06)":"rgba(0,140,70,0.06)",
+              border:`1px solid ${C.green}33`}}>
+              <div style={{fontSize:10,color:C.green,fontWeight:700,marginBottom:4}}>🔮 2Q26 전망 (2026.7 발표 예정)</div>
+              <div style={{fontSize:10,color:C.text}}>영업이익 <strong style={{color:C.green}}>81조원</strong> 예상 (어닝 서프라이즈 가능성)</div>
+            </div>
+          </Card>
+
+          {/* 증권사별 최신 전망 비교 */}
+          <Card style={{marginBottom:12}}>
+            <Label>🏦 증권사별 2026년 전사 영업이익 전망 (최신순)</Label>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
+              <thead><tr style={{borderBottom:`1px solid ${C.bd}`}}>
+                {["증권사","발표일","전망치","변화"].map(h=>(
+                  <th key={h} style={{padding:"6px 4px",fontSize:9,color:C.muted,fontWeight:600,textAlign:h==="증권사"?"left":"right"}}>{h}</th>
+                ))}
+              </tr></thead>
+              <tbody>
+                {[
+                  {firm:"🌍 Citi",date:"2026.06",val:251,chg:"DRAM +171%·NAND +127% YoY 전망"},
+                  {firm:"🌍 KB증권(외국계분석)",date:"2026.05.04",val:360,chg:"+8% 상향, 1Q호실적+2Q가격전망"},
+                  {firm:"🌍 Macquarie",date:"2026.06",val:null,chg:"목표주가 34만원 (상승여력 80%)"},
+                  {firm:"🌍 Morgan Stanley",date:"2026.02",val:null,chg:"목표주가 24.8만→밴드 상향, ROE13%·영업이익률35%"},
+                  {firm:"🌍 Goldman Sachs",date:"2026.03",val:null,chg:"목표주가 20.5→26만원, HBM매출 $14B(26)→$19B(27)"},
+                  {firm:"키움증권",date:"2026.03.03",val:200,chg:"기존 대비 대폭 상향"},
+                  {firm:"대신증권",date:"2026.02.23",val:201,chg:"171→201조 상향"},
+                  {firm:"유진투자",date:"2026.01.30",val:148,chg:"DS 136.9조 포함"},
+                ].map(r=>(
+                  <tr key={r.firm} style={{borderBottom:`1px solid ${C.bd}`}}>
+                    <td style={{padding:"7px 4px",color:C.text,fontWeight:700}}>{r.firm}</td>
+                    <td style={{padding:"7px 4px",textAlign:"right",color:C.muted,fontSize:9}}>{r.date}</td>
+                    <td style={{padding:"7px 4px",textAlign:"right",color:C.blue,fontWeight:800,fontSize:13}}>{r.val?r.val+'조':'-'}</td>
+                    <td style={{padding:"7px 4px",textAlign:"right",color:C.muted,fontSize:7}}>{r.chg}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{fontSize:8,color:C.cyan,marginTop:8,fontWeight:700}}>
+              📈 시간이 갈수록 전망치가 계속 상향 조정되는 추세 (148조→201조→360조, 외국계도 동조)
+            </div>
+          </Card>
+
+          {/* 외국계 목표주가 컨센서스 */}
+          <Card style={{marginBottom:12}}>
+            <Label c={C.purple}>🌍 외국계(Global IB) 목표주가 컨센서스</Label>
+            <div style={{fontSize:9,color:C.muted,marginBottom:10}}>
+              37개 증권사 평균 목표주가(2026.4.29 기준): <strong style={{color:C.text}}>274,603원</strong> ·
+              36개사 최신 평균(2026.6): <strong style={{color:C.text}}>283,171원</strong>
+            </div>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
+              <thead><tr style={{borderBottom:`1px solid ${C.bd}`}}>
+                {["IB","목표주가","현재比"].map(h=>(
+                  <th key={h} style={{padding:"6px 4px",fontSize:9,color:C.muted,fontWeight:600,textAlign:h==="IB"?"left":"right"}}>{h}</th>
+                ))}
+              </tr></thead>
+              <tbody>
+                {[
+                  {firm:"Macquarie",tp:340000,note:"메모리=AI추론 시대 병목, 80%↑여력"},
+                  {firm:"Citi",tp:280000,note:"기존 24만→상향"},
+                  {firm:"Goldman Sachs",tp:260000,note:"기존 20.5만→상향, HBM4 낙관"},
+                  {firm:"Morgan Stanley",tp:248000,note:"기존 21만→상향, 조 단위 시총 전망"},
+                  {firm:"전체 평균(37개사)",tp:274603,note:"2026.4.29 MarketScreener"},
+                ].map(r=>{
+                  const upside=Math.round((r.tp-stkNow)/stkNow*100);
+                  return(
+                    <tr key={r.firm} style={{borderBottom:`1px solid ${C.bd}`}}>
+                      <td style={{padding:"7px 4px",color:C.text,fontWeight:700,fontSize:9}}>{r.firm}</td>
+                      <td style={{padding:"7px 4px",textAlign:"right",color:C.purple,fontWeight:700}}>{(r.tp/10000).toFixed(1)}만</td>
+                      <td style={{padding:"7px 4px",textAlign:"right",color:upside>0?C.green:C.red,fontSize:9}}>{upside>0?'+':''}{upside}%</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <div style={{fontSize:8,color:C.muted,marginTop:8,lineHeight:1.6}}>
+              💡 Citi: 2026년 영업이익 <strong style={{color:C.text}}>251조원</strong> 전망 (DRAM·NAND 슈퍼사이클) ·
+              일부 스트리트하이(street-high) 전망은 48만원까지 제시 · 6월 초 시총 $1.54T 돌파, 메타·테슬라 추월
+            </div>
+          </Card>
+
+          {/* DS부문 분기 추이 + 연간 환산 */}
+          <Card style={{marginBottom:12}}>
+            <Label>📊 DS부문 분기 실적 추이</Label>
+            {[
+              {q:"4Q25",val:17,note:"실적"},
+              {q:"1Q26",val:53.7,note:"실적 (사상 최대)"},
+              {q:"2Q26(E)",val:65,note:"전사 81조 가정시 추정"},
+            ].map((d,i)=>{
+              const maxV=70;
+              const bw=Math.round(d.val/maxV*100);
+              return(
+                <div key={d.q} style={{marginBottom:8}}>
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:3}}>
+                    <span style={{color:YC[i],fontWeight:700}}>{d.q}</span>
+                    <strong style={{color:YC[i]}}>{d.val}조원</strong>
+                  </div>
+                  <div style={{height:14,background:darkMode?"rgba(255,255,255,0.05)":"rgba(0,0,0,0.05)",borderRadius:4,overflow:"hidden"}}>
+                    <div style={{height:"100%",width:`${bw}%`,background:YC[i],borderRadius:4}}/>
+                  </div>
+                  <div style={{fontSize:7,color:C.muted,marginTop:1}}>{d.note}</div>
+                </div>
+              );
+            })}
+            <div style={{marginTop:8,padding:"8px 10px",borderRadius:7,background:darkMode?"rgba(0,216,255,0.05)":"rgba(0,150,200,0.05)",fontSize:9,color:C.text}}>
+              💡 1Q(53.7조) + 2Q(65조 가정) + 3Q + 4Q 단순 연환산 시 <strong style={{color:C.cyan}}>DS부문 연간 220~280조</strong> 가능 영역 진입
+            </div>
+          </Card>
+
+          {/* 계산기 시나리오와 비교 */}
+          <Card ac="green" style={{marginBottom:12}}>
+            <Label c={C.green}>✅ 계산기 시나리오와 비교</Label>
+            <div style={{fontSize:9,color:C.muted,marginBottom:8}}>최신 KB증권 전망(전사 360조) 기준 DS부문 환산 vs 계산기 시나리오</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+              {[
+                {l:"슈퍼낙관",v:SCENARIOS.bull2.ds[2026],c:"#00ff88"},
+                {l:"낙관",v:SCENARIOS.bull.ds[2026],c:C.green},
+                {l:"기본",v:SCENARIOS.base.ds[2026],c:C.cyan},
+              ].map(x=>(
+                <div key={x.l} style={{textAlign:"center",background:darkMode?"rgba(255,255,255,0.03)":"rgba(0,0,0,0.03)",borderRadius:8,padding:"8px"}}>
+                  <div style={{fontSize:8,color:C.muted}}>{x.l}</div>
+                  <div style={{fontSize:14,fontWeight:800,color:x.c}}>{x.v}조</div>
+                </div>
+              ))}
+            </div>
+            <div style={{padding:"10px 12px",borderRadius:9,background:darkMode?"rgba(0,240,144,0.08)":"rgba(0,140,70,0.07)",
+              border:`1px solid ${C.green}44`}}>
+              <div style={{fontSize:10,color:C.green,fontWeight:700,marginBottom:4}}>📌 결론</div>
+              <div style={{fontSize:10,color:C.text,lineHeight:1.6}}>
+                KB증권 전사 전망 360조 중 DS부문 비중(1Q 기준 94%)을 적용하면 DS 약 <strong style={{color:C.green}}>340조원</strong> 수준.
+                이는 계산기 <strong style={{color:"#00ff88"}}>슈퍼낙관(500조)와 낙관(400조) 사이</strong>에 해당하며,
+                기존 기본 시나리오(360조)와도 근접합니다.
+              </div>
+            </div>
+          </Card>
+
+          {/* 시나리오 적용 버튼 */}
+          <Card style={{marginBottom:12}}>
+            <Label>🔄 최신 전망 기준 시나리오 적용</Label>
+            <div style={{fontSize:9,color:C.muted,marginBottom:10}}>
+              KB증권 최신 전망(2026.5.4) 기반 추정치를 바로 적용합니다. 2026년 340조 기준, 이후 메모리 슈퍼사이클 지속 가정.
+            </div>
+            <button onClick={()=>{
+              const newDs={2026:340,2027:420,2028:480,2029:430,2030:380};
+              setDs(newDs);
+              setScenario("custom");
+            }} style={{
+              width:"100%",padding:"12px",borderRadius:10,fontSize:12,fontWeight:700,cursor:"pointer",
+              background:"linear-gradient(135deg,#1499ff,#0044bb)",border:"none",color:"#fff"}}>
+              📊 최신 전망 시나리오 적용 (340→420→480→430→380조) →
+            </button>
+          </Card>
+
+          <div style={{fontSize:9,color:"#4e6880",lineHeight:1.8,padding:"7px 10px",borderRadius:8,
+            background:darkMode?"rgba(255,200,50,0.04)":"rgba(180,140,0,0.05)",border:`1px solid ${C.yellow}22`}}>
+            ⚠️ 메모리 반도체는 변동성이 매우 큰 산업으로 분기 단위로 전망치가 크게 바뀜 · 2026년은 1Q 실적 기반 신뢰도 높으나 2027년 이후는 불확실성 매우 높음 ·
+            출처: 삼성전자 1Q26 실적발표(2026.4.30), KB증권(2026.5.4), 키움증권(2026.3.3), 대신증권(2026.2.23)
+          </div>
+        </>);
+      })()}
+
+            {/* ══ 산식 가이드 탭 ══ */}
+      {tab==="guide"&&<>
+        {/* OPI1 */}
+        <Card style={{marginBottom:12}}>
+          <Label c={C.cyan}>💵 OPI1 산출 과정 (현금)</Label>
+          {[
+            {step:"① 전체 OPI1 재원",formula:"DS 영업이익 × 10%",example:`DS 300조 × 10% = 30조`},
+            {step:"② 1인당 배분액",formula:"재원 ÷ DS 총인원 ÷ 평균연봉 = 지급률",example:`30조 ÷ 79,000명 ÷ 8,500만 = 44.7%`},
+            {step:"③ OPI1 지급률",formula:"최대 상한 50% 캡 적용",example:`min(44.7%, 50%) = 44.7%`},
+            {step:"④ 내 OPI1 (세전)",formula:"내 연봉 × OPI1 지급률",example:`1억1천 × 44.7% = 4,917만원`},
+            {step:"⑤ 세금",formula:"(연봉+OPI1) 누진세 - 연봉 누진세",example:`성과급이 높은 구간에서 세율 38~42% 적용`},
+          ].map((x,i)=>(
+            <div key={i} style={{marginBottom:12,padding:"10px 12px",borderRadius:9,background:darkMode?"rgba(0,216,255,0.05)":"rgba(0,150,200,0.06)",border:`1px solid ${C.cyan}33`}}>
+              <div style={{fontSize:10,fontWeight:700,color:C.cyan,marginBottom:4}}>{x.step}</div>
+              <div style={{fontSize:10,color:C.text,marginBottom:3}}>📐 {x.formula}</div>
+              <div style={{fontSize:9,color:C.muted}}>👉 {x.example}</div>
+            </div>
+          ))}
+        </Card>
+
+        {/* OPI2 */}
+        <Card style={{marginBottom:12}}>
+          <Label c={C.yellow}>📦 OPI2 산출 과정 (자사주)</Label>
+          {[
+            {step:"① 상생재원 차감",formula:"(DS OP - 1조) × 0.3% 먼저 차감",example:`(300조 - 1조) × 0.3% = 0.897조`},
+            {step:"② 성과급 기반 OP",formula:"DS OP - 상생재원",example:`300조 - 0.897조 = 299.1조`},
+            {step:"③ OPI2 재원",formula:"(기반OP - OPI1 총지급분) × 10.5%",example:`(299.1조 - 30조) × 10.5% = 28.3조`},
+            {step:"④ 배분",formula:"부문 40% (DS균등) + 사업부 60% (메모리 90%비중)",example:`메모리: 공통 1.43억 + 사업부 5.69억 = 7.1억`},
+            {step:"⑤ 공통부서",formula:"메모리 OPI2 × 70%",example:`7.1억 × 70% = 5.0억`},
+            {step:"⑥ 적자사업부",formula:"2026년 유예(공통지급률), 2027년~ 공통×60%",example:`2026: 1.43억 / 2027~: 0.86억`},
+            {step:"⑦ 세금",formula:"(연봉+OPI1+OPI2) 누진세 — OPI2 해당분",example:`OPI2는 최고 46~49% 세율 구간에 걸림`},
+            {step:"⑧ 지급",formula:"세후 전액 자사주 지급",example:`1/3 즉시 매각 가능 · 1/3 1년 락업 · 1/3 2년 락업`},
+          ].map((x,i)=>(
+            <div key={i} style={{marginBottom:10,padding:"10px 12px",borderRadius:9,background:darkMode?"rgba(255,208,60,0.05)":"rgba(180,140,0,0.06)",border:`1px solid ${C.yellow}33`}}>
+              <div style={{fontSize:10,fontWeight:700,color:C.yellow,marginBottom:4}}>{x.step}</div>
+              <div style={{fontSize:10,color:C.text,marginBottom:3}}>📐 {x.formula}</div>
+              <div style={{fontSize:9,color:C.muted}}>👉 {x.example}</div>
+            </div>
+          ))}
+        </Card>
+
+        {/* PSU */}
+        <Card style={{marginBottom:12}}>
+          <Label c={C.purple}>📈 PSU 산출 과정</Label>
+          {[
+            {step:"① 기준가",formula:"2025.10.15 기준주가",example:`85,385원`},
+            {step:"② 평가기준일",formula:"2028.10.13 주가로 상승률 계산",example:`현재가 322,500원 → 2028년 예상가`},
+            {step:"③ 지급 배수",formula:"기준가 대비 상승률 구간별 배수 결정",example:`+100% 이상 → 2배 / +80~100% → 1.7배 / +40~60% → 1배`},
+            {step:"④ 지급 주수",formula:"약정주수 × 배수",example:`CL3: 300주 × 2배 = 600주`},
+            {step:"⑤ 이익금 확정",formula:"지급 주수 × 2028.10 평가주가 (이후 주가변동 무관)",example:`600주 × 40만원 = 2.4억 (3년 합계 세전)`},
+            {step:"⑥ 수령",formula:"1/3씩 2028·2029·2030년 분할 수령",example:`각 200주씩 · 금액은 2028 주가 기준 고정`},
+          ].map((x,i)=>(
+            <div key={i} style={{marginBottom:10,padding:"10px 12px",borderRadius:9,background:darkMode?"rgba(176,96,255,0.05)":"rgba(120,60,200,0.05)",border:`1px solid ${C.purple}33`}}>
+              <div style={{fontSize:10,fontWeight:700,color:C.purple,marginBottom:4}}>{x.step}</div>
+              <div style={{fontSize:10,color:C.text,marginBottom:3}}>📐 {x.formula}</div>
+              <div style={{fontSize:9,color:C.muted}}>👉 {x.example}</div>
+            </div>
+          ))}
+        </Card>
+
+        {/* 세금 */}
+        <Card style={{marginBottom:12}}>
+          <Label c={C.red}>🧾 누진세 구조 (2026년 기준)</Label>
+          <div style={{marginBottom:8,fontSize:9,color:C.muted}}>지방세 10% 포함 실효세율 · 연봉 → OPI1 → OPI2 순으로 누적 적용</div>
+          {[
+            {range:"~1,400만",rate:"6.6%"},
+            {range:"~5,000만",rate:"16.5%"},
+            {range:"~8,800만",rate:"26.4%"},
+            {range:"~1.5억",rate:"38.5%"},
+            {range:"~3억",rate:"41.8%"},
+            {range:"~5억",rate:"44.0%"},
+            {range:"~10억",rate:"46.2%"},
+            {range:"10억 초과",rate:"49.5%"},
+          ].map((x,i)=>(
+            <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+              padding:"6px 10px",borderRadius:6,marginBottom:3,
+              background:i>=4?darkMode?"rgba(255,80,80,0.08)":"rgba(200,50,50,0.06)":darkMode?"rgba(255,255,255,0.03)":"rgba(0,0,0,0.03)"}}>
+              <span style={{fontSize:10,color:C.sub}}>{x.range}</span>
+              <span style={{fontSize:11,fontWeight:700,color:i>=4?C.red:i>=2?C.orange:C.muted}}>{x.rate}</span>
+            </div>
+          ))}
+          <div style={{marginTop:8,padding:"8px 10px",borderRadius:7,background:darkMode?"rgba(255,80,80,0.06)":"rgba(200,50,50,0.05)",fontSize:9,color:C.muted}}>
+            ⚠️ 연봉 1억1천 기준 OPI2는 41.8~46.2% 구간에 걸림 · OPI2 세금을 현금으로 납부해야 함
+          </div>
+        </Card>
+
+        {/* 4대보험 */}
+        <Card style={{marginBottom:12}}>
+          <Label>🏥 4대보험 (2026년 근로자 부담)</Label>
+          {[
+            {name:"건강보험",rate:"3.595%",note:"성과급 포함 → 연말정산 추가 부과"},
+            {name:"장기요양",rate:"건보료×13.14%",note:""},
+            {name:"국민연금",rate:"4.75%",note:"월 637만원 상한 (연 7,644만)"},
+            {name:"고용보험",rate:"0.9%",note:""},
+          ].map(x=>(
+            <div key={x.name} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+              padding:"7px 10px",borderRadius:6,marginBottom:3,
+              background:darkMode?"rgba(255,255,255,0.03)":"rgba(0,0,0,0.03)"}}>
+              <div>
+                <span style={{fontSize:10,fontWeight:700,color:C.text}}>{x.name}</span>
+                {x.note&&<div style={{fontSize:8,color:C.muted,marginTop:1}}>{x.note}</div>}
+              </div>
+              <span style={{fontSize:11,fontWeight:700,color:C.cyan}}>{x.rate}</span>
+            </div>
+          ))}
+        </Card>
+
+        <div style={{fontSize:9,color:C.muted,lineHeight:1.8,padding:"10px 12px",borderRadius:8,
+          background:darkMode?"rgba(255,200,50,0.04)":"rgba(180,140,0,0.05)",border:`1px solid ${C.yellow}22`}}>
+          ⚠️ 본 시뮬레이터는 참고용이며 실제 수령액과 다를 수 있습니다 · 실제 성과급은 회사 공식 발표 기준 · 세금은 공인세무사 상담 권장
+        </div>
+      </>}
+
+      </div>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
